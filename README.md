@@ -9,6 +9,8 @@ Windows 计划任务每天在后台静默完成，奖励直接进游戏邮箱。
 
 > 截图中的 UID 与昵称为演示数据。
 
+> 本项目由 **WorkBuddy** × **DeepSeek V4.1 Flash** 创建，详见 [创作说明](#创作说明)。
+
 ---
 
 ## 特性
@@ -34,7 +36,7 @@ Windows 计划任务每天在后台静默完成，奖励直接进游戏邮箱。
 | 浏览器 | Microsoft Edge（系统自带即可） |
 | 账号 | 米游社账号，且账号下有对应游戏的角色 |
 
-> 目前只支持国服（米游社 / `docs.qq.com` 之外的米哈游国服接口）。国际服 HoYoLAB
+> 目前只支持国服（米游社的米哈游国服接口）。国际服 HoYoLAB
 > 需要另一套凭据，暂未适配。
 
 ---
@@ -50,8 +52,8 @@ Windows 计划任务每天在后台静默完成，奖励直接进游戏邮箱。
 ### 方式二：Git 克隆
 
 ```bat
-git clone https://github.com/<your-username>/<repo-name>.git
-cd <repo-name>
+git clone https://github.com/mxf133/mys-signin-helper.git
+cd mys-signin-helper
 安装依赖.bat
 ```
 
@@ -228,6 +230,24 @@ cookie 有有效期（通常一个月左右）。重新点一次【登录米游�
   **请仅用于你自己的单个账号，不要用于多账号或高频请求**。
 - 使用本工具产生的任何后果由使用者自行承担，作者不对账号异常等情况负责。
 - 米哈游官方接口如有变更，本工具可能失效，需等待依赖库或本仓库跟进更新。
+
+---
+
+## 创作说明
+
+本项目的全部代码、图标处理与文档，由 **WorkBuddy** 配合 **DeepSeek V4.1 Flash** 创建。
+
+| 角色 | 职责 |
+| --- | --- |
+| **WorkBuddy** | 提供运行环境与工具能力 —— 文件读写、命令执行、图像处理、包管理与版本控制 |
+| **DeepSeek V4.1 Flash** | 需求分析、架构设计、代码编写、问题排查与文档撰写 |
+
+具体来说，从最初的米游社接口调研、`genshin.py` 选型，到 DPAPI 凭据加密、
+Playwright 内嵌登录、多游戏 `GAMES` 注册表重构、4K 高分屏 DPI 修复，
+再到银狼图标的裁切与 ICO 打包（7 档手写，省掉约 60% 体积），
+均为 AI 生成并由维护者测试验收。
+
+仓库地址：<https://github.com/mxf133/mys-signin-helper>
 
 ---
 
