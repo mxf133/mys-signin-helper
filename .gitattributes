@@ -1,0 +1,16 @@
+# 默认按文本处理，提交时自动规范化换行
+* text=auto
+
+# Windows 批处理必须是 CRLF，否则 cmd 解析 goto/label 会出错
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Python / 文档统一 LF
+*.py  text eol=lf
+*.pyw text eol=lf
+*.md  text eol=lf
+*.txt text eol=lf
+
+# 二进制文件不做任何换行转换
+*.ico binary
+*.png binary

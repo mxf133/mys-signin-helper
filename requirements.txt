@@ -1,0 +1,9 @@
+# 米游社签到助手 运行依赖
+# 重新安装：双击 安装依赖.bat，或执行
+#   .venv\Scripts\python.exe -m pip install -r requirements.txt
+
+# 米游社接口客户端（原神对应 x-rpc-signgame: hk4e，崩铁对应 hkrpg）
+genshin>=1.7.30
+
+# 用于拉起本机 Edge 完成米游社登录并读取 cookie
+playwright>=1.40
