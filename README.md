@@ -48,11 +48,15 @@ Windows 计划任务每天在后台静默完成，奖励直接进游戏邮箱。
 ### 方式零：便携版（不想装 Python 就选这个）
 
 到 [Releases](https://github.com/mxf133/mys-signin-helper/releases/latest) 下载
-**`米游社签到助手-vX.Y.Z-便携版.zip`**，解压后双击 **`米游社签到助手.exe`** 即可。
+**`mys-signin-helper-vX.Y.Z-portable.zip`**，解压后双击 **`米游社签到助手.exe`** 即可。
 
 - 免安装、免配环境，解压到桌面或 D 盘都能直接跑
 - **别放在 `C:\Program Files` 这类受保护目录**，否则凭据和日志写不进去
 - 出问题就双击 **`自检.bat`**，会生成并打开一份「自检报告.txt」
+
+> 为什么 Release 上的 zip 名是英文？GitHub 会剥掉发行附件名里的非 ASCII
+> 字符，中文名上传后会变成 `-v2.1.0-.zip` 这种残名。压缩包**里面**的目录和
+> exe 仍然是中文名，不影响使用。
 
 ### 方式一：下载源码后一键安装
 
@@ -158,7 +162,8 @@ python -m venv .venv
 .venv\Scripts\python.exe build_portable.py
 ```
 
-产物在 `dist_portable\米游社签到助手-v<版本>-便携版.zip`。
+产物在 `dist_portable\mys-signin-helper-v<版本>-portable.zip`
+（解压后的目录与 exe 是中文名）。
 
 脚本会先把源码复制到一个临时目录再交给 PyInstaller —— 这样能确保
 `cookie.enc`、`.edge_profile\`、`signin.log` 这类私有文件**不会**被打进发行包，

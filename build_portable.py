@@ -7,7 +7,11 @@
     .venv\\Scripts\\python.exe build_portable.py
 
 产物:
-    dist_portable\\米游社签到助手-v<版本>-便携版.zip
+    dist_portable\\mys-signin-helper-v<版本>-portable.zip
+      └─ 解压后是「米游社签到助手-v<版本>-便携版\\」，exe 为中文名
+
+    zip 本身用 ASCII 名，是因为 GitHub Release 会剥掉资产名里的非 ASCII
+    字符（中文名上传后会变成 "…-v2.1.0-.zip" 这种残名）。
 
 为什么先把源码复制到临时目录再打包：
   1. 避免 PyInstaller 顺着项目目录把 cookie.enc、.edge_profile、signin.log
@@ -152,9 +156,12 @@ def main() -> int:
     print("      目录 %s（%.1f MB）" % (out.name, total / 1e6))
 
     print("[5/5] 压缩")
-    zip_base = DIST / out.name
-    if (DIST / (out.name + ".zip")).exists():
-        (DIST / (out.name + ".zip")).unlink()
+    # zip 用 ASCII 名：GitHub Release 会剥掉资产名里的非 ASCII 字符，
+    # 若用中文名上传会变成 "…-v2.1.0-.zip" 这种残名。解压出来的目录和
+    # exe 仍然是中文名，不影响使用。
+    zip_base = DIST / ("mys-signin-helper-v%s-portable" % version)
+    if Path(str(zip_base) + ".zip").exists():
+        Path(str(zip_base) + ".zip").unlink()
     archive = shutil.make_archive(str(zip_base), "zip", root_dir=str(DIST),
                                   base_dir=out.name)
     zsize = Path(archive).stat().st_size
