@@ -24,16 +24,33 @@ from pathlib import Path
 BASE = Path(__file__).resolve().parent
 
 
+def _in_project_venv() -> bool:
+    """当前解释器是否已经在项目的 .venv 里。
+
+    不能比较可执行文件名：`.venv\\Scripts` 下 python.exe 与 pythonw.exe 并存，
+    计划任务用 pythonw.exe 调本脚本（core.task_command），手动调试用
+    python.exe，一比文件名就会永远判定"环境不对"，于是每次定时签到都多起
+    一个进程在外面干等，任务也永远不会真正结束。
+    """
+    try:
+        if os.path.normcase(str(Path(sys.prefix).resolve())) == \
+           os.path.normcase(str((BASE / ".venv").resolve())):
+            return True
+    except Exception:
+        pass
+    try:
+        return os.path.normcase(str(Path(sys.executable).resolve().parent)) == \
+               os.path.normcase(str((BASE / ".venv" / "Scripts").resolve()))
+    except Exception:
+        return False
+
+
 def _ensure_venv():
+    if _in_project_venv():
+        return
     exe = BASE / ".venv" / "Scripts" / "python.exe"
     if not exe.exists():
         return
-    try:
-        if os.path.normcase(str(Path(sys.executable).resolve())) == \
-           os.path.normcase(str(exe.resolve())):
-            return
-    except Exception:
-        pass
     try:
         sys.exit(subprocess.call([str(exe), str(Path(__file__).resolve())] + sys.argv[1:]))
     except Exception:

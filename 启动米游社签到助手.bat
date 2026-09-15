@@ -1,7 +1,7 @@
 @echo off
+chcp 65001 >nul
 rem 米游社签到助手 - 启动图形界面（不弹命令行窗口）
 cd /d "%~dp0"
-chcp 65001 >nul
 
 if not exist "%~dp0.venv\Scripts\pythonw.exe" goto NOPY
 

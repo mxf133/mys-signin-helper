@@ -21,7 +21,7 @@ from pathlib import Path
 BASE = Path(__file__).resolve().parent
 APP_TITLE = "米游社签到助手"
 APP_SUB = "原神 · 崩坏：星穹铁道 · 米游社每日签到"
-VERSION = "2.0"
+VERSION = "2.0.1"
 
 # 4K 屏上 Windows 缩放常为 150%~200%。进程若未声明 DPI 感知，系统会把整个
 # 窗口当位图放大——字体边缘被插值糊掉，这是界面发虚的根因。
@@ -82,19 +82,35 @@ def px(v):
 
 
 # ---------------------------------------------------------------- 环境自举
+def _in_project_venv() -> bool:
+    """当前解释器是否已经在项目的 .venv 里。
+
+    不能比较可执行文件名：`.venv\\Scripts` 下 python.exe 和 pythonw.exe 并存，
+    手动调试用 python.exe、计划任务用 pythonw.exe，一比文件名就永远判定
+    "环境不对"，于是每次启动都白白多起一个进程在外面干等。
+    """
+    try:
+        if os.path.normcase(str(Path(sys.prefix).resolve())) == \
+           os.path.normcase(str((BASE / ".venv").resolve())):
+            return True
+    except Exception:
+        pass
+    try:
+        return os.path.normcase(str(Path(sys.executable).resolve().parent)) == \
+               os.path.normcase(str((BASE / ".venv" / "Scripts").resolve()))
+    except Exception:
+        return False
+
+
 def _ensure_venv():
     """确保用项目自带的 venv 运行（用户直接双击 .pyw 也不会缺依赖）。"""
+    if _in_project_venv():
+        return
     exe = BASE / ".venv" / "Scripts" / "pythonw.exe"
     if not exe.exists():
         exe = BASE / ".venv" / "Scripts" / "python.exe"
     if not exe.exists():
         return
-    try:
-        if os.path.normcase(str(Path(sys.executable).resolve())) == \
-           os.path.normcase(str(exe.resolve())):
-            return
-    except Exception:
-        pass
     try:
         subprocess.Popen([str(exe), str(Path(__file__).resolve())], cwd=str(BASE))
     except Exception:
@@ -532,15 +548,22 @@ class App:
 
     def _after_run(self, res, done_status):
         self._render()
-        if done_status and res.get("ok"):
-            self.set_status(done_status, OK)
-            return
-        msg = res.get("message") or core.summarize(res)
-        if msg:
-            games = res.get("games") or {}
-            bad = any(g.get("status") in ("invalid_cookie", "failed", "error",
-                                          "not_logged_in") for g in games.values())
-            self.set_status(msg, BAD if bad else SUBTEXT)
+        res = res or {}
+        games = res.get("games") or {}
+        bad = any((g or {}).get("status") in ("invalid_cookie", "failed", "error",
+                                              "not_logged_in")
+                  for g in games.values())
+        if res.get("ok") and not bad:
+            self.set_status(done_status or res.get("message") or "完成", OK)
+        elif res.get("ok"):
+            # 部分成功（例如原神签上了、崩铁失败）：用黄字把两边的实际情况都摆出来
+            self.set_status(core.summarize(res) or done_status or "部分完成", WARN)
+        elif games:
+            self.set_status(res.get("message") or core.summarize(res) or "操作失败", BAD)
+        else:
+            # 登录 / 计划任务这类没有 games 字段的操作：一律以 ok 判定，
+            # 之前只认 games，导致登录失败也显示灰色，很容易被当成没事。
+            self.set_status(res.get("message") or done_status or "操作失败", BAD)
 
     # ------------------------------------------------------------ 具体动作
     def do_sign_all(self):

@@ -81,7 +81,9 @@ def write_log(msg: str):
 
 
 def read_log_tail(n: int = MAX_LOG_LINES) -> str:
-    if not LOG_FILE.exists():
+    # n <= 0 时必须显式返回空：lines[-0:] 在 Python 里等价于 lines[0:]，
+    # 会静默地把整个日志吐出来。
+    if n <= 0 or not LOG_FILE.exists():
         return ""
     try:
         lines = LOG_FILE.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -134,8 +136,16 @@ def save_settings(**kw) -> dict:
 
 def load_state() -> dict:
     st = _read_json(STATE_FILE, {}) or {}
-    st.setdefault("games", {})
-    st.setdefault("accounts", {})
+    if not isinstance(st, dict):
+        st = {}
+    # state.json 可能被手工编辑坏（games 写成 null / 列表）。这里必须用
+    # isinstance 而不是 setdefault——setdefault 只判断"键在不在"，
+    # 对"键在、值是 null"完全无效，随后 save_game_state 就会抛
+    # AttributeError，整个程序打不开。
+    if not isinstance(st.get("games"), dict):
+        st["games"] = {}
+    if not isinstance(st.get("accounts"), dict):
+        st["accounts"] = {}
     # 兼容早期只有崩铁的扁平结构
     if not st["games"] and any(k in st for k in ("days", "signed_today", "last_run")):
         st["games"]["starrail"] = {
@@ -163,7 +173,11 @@ def save_state(**kw) -> dict:
 
 def save_game_state(key: str, **kw) -> dict:
     st = load_state()
-    g = st.setdefault("games", {}).setdefault(key, {})
+    games = st.setdefault("games", {})
+    g = games.get(key)
+    if not isinstance(g, dict):
+        g = {}
+        games[key] = g
     g.update(kw)
     for k in STATE_LEGACY_KEYS:
         st.pop(k, None)
@@ -262,6 +276,7 @@ def login(on_log=None, timeout_sec: int = 600) -> dict:
     emit("登录成功后窗口会自动关闭，最多等待 %d 分钟" % (timeout_sec // 60))
 
     found = None
+    closed = False
     try:
         with sync_playwright() as p:
             ctx = p.chromium.launch_persistent_context(
@@ -279,9 +294,18 @@ def login(on_log=None, timeout_sec: int = 600) -> dict:
 
                 waited = 0
                 while waited < timeout_sec:
+                    # 先读 cookie：用户手动关掉窗口时，第一个抛异常的就是
+                    # ctx.cookies()。放在循环体最前面并就地捕获，才能把
+                    # "窗口被关闭"和"启动浏览器失败"区分开——否则异常会一路
+                    # 冒泡到外层，报出完全无关的"启动浏览器失败"。
+                    try:
+                        raw = ctx.cookies()
+                    except Exception:
+                        closed = True
+                        break
                     cookies = {
                         c["name"]: c["value"]
-                        for c in ctx.cookies()
+                        for c in raw
                         if any(k in c.get("domain", "")
                                for k in ("mihoyo", "miyoushe", "hoyolab"))
                     }
@@ -290,8 +314,10 @@ def login(on_log=None, timeout_sec: int = 600) -> dict:
                         break
                     try:
                         if not ctx.pages:
+                            closed = True
                             break
                     except Exception:
+                        closed = True
                         break
                     import time as _t
                     _t.sleep(1)
@@ -307,8 +333,12 @@ def login(on_log=None, timeout_sec: int = 600) -> dict:
         return res
 
     if not found:
-        res["status"] = "timeout"
-        res["message"] = "未检测到登录状态（超时或窗口被关闭），请重试"
+        if closed:
+            res["status"] = "closed"
+            res["message"] = "登录窗口在完成登录前被关闭了，未保存凭据，请重试"
+        else:
+            res["status"] = "timeout"
+            res["message"] = "等待 %d 分钟仍未检测到登录状态，请重试" % (timeout_sec // 60)
         emit(res["message"])
         return res
 
@@ -648,8 +678,16 @@ def local_state() -> dict:
         g["signgame"] = cfg["signgame"]
         g["account"] = accounts.get(k) or {}
         detail.append(g)
+
+    # cred_ok 必须同时看两处：文件在不在 + state.json 里的标记。
+    # 只看文件的话，cookie 失效时 _sign_many_async 写入的 cred_ok=False 会被
+    # 忽略，右上角一直绿着显示"已登录"，跟卡片上"需重新登录"自相矛盾。
+    cred_flag = st.get("cred_ok")
+    if cred_flag is None:
+        cred_flag = CRED_FILE.exists()   # 兼容早期没有该字段的 state.json
+
     return {
-        "cred_ok": CRED_FILE.exists(),
+        "cred_ok": bool(cred_flag) and CRED_FILE.exists(),
         "login_time": st.get("login_time"),
         "task_time": settings.get("task_time", "09:05"),
         "game_list": detail,
