@@ -24,7 +24,25 @@ from pathlib import Path
 
 # ---------------------------------------------------------------- 路径与常量
 
-BASE = Path(__file__).resolve().parent
+def is_frozen() -> bool:
+    """是否运行在 PyInstaller 打包出的 exe 里。"""
+    return bool(getattr(sys, "frozen", False))
+
+
+def _app_dir() -> Path:
+    """程序数据目录（凭据、日志、状态都存这里）。
+
+    源码运行时就是项目目录；打包成 exe 后 `__file__` 指向 PyInstaller 的
+    临时解包目录（_MEIPASS），每次启动都不一样，若沿用它，cookie.enc 会在
+    退出时被清掉、signin.log 也会凭空消失。所以冻结模式下必须改用 exe
+    所在的目录。
+    """
+    if is_frozen():
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+BASE = _app_dir()
 CRED_FILE = BASE / "cookie.enc"
 PROFILE_DIR = BASE / ".edge_profile"
 LOG_FILE = BASE / "signin.log"
@@ -542,15 +560,18 @@ def summarize(result: dict) -> str:
 
 # ---------------------------------------------------------------- Windows 计划任务
 
-def _python_for_task() -> str:
-    pw = BASE / ".venv" / "Scripts" / "pythonw.exe"
-    if pw.exists():
-        return str(pw)
-    return sys.executable
-
-
 def task_command() -> str:
-    return '"%s" "%s" sign' % (_python_for_task(), BASE / "cli.py")
+    """计划任务要执行的命令行。
+
+    源码模式：用 .venv 的 pythonw.exe（无黑窗）跑 cli.py。
+    打包模式：exe 自己就能带 sign 参数跑（app.pyw 会把参数转给 cli），
+    既不需要额外的解释器，也没有 cli.py 这个文件可指。
+    """
+    if is_frozen():
+        return '"%s" sign' % sys.executable
+    pw = BASE / ".venv" / "Scripts" / "pythonw.exe"
+    py = str(pw) if pw.exists() else sys.executable
+    return '"%s" "%s" sign' % (py, BASE / "cli.py")
 
 
 def _query(name: str) -> bool:

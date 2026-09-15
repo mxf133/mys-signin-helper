@@ -1,6 +1,6 @@
 # 米游社签到助手
 
-> **当前版本 v2.0.1** · [更新日志](#更新日志)
+> **当前版本 v2.1.0** · [更新日志](#更新日志)
 
 原神 + 崩坏：星穹铁道（国服 · 米游社账号）每日自动签到工具，带图形界面。
 
@@ -31,12 +31,12 @@ Windows 计划任务每天在后台静默完成，奖励直接进游戏邮箱。
 
 ## 环境要求
 
-| 项目 | 要求 |
-| --- | --- |
-| 操作系统 | Windows 10 / 11 |
-| Python | 3.10 或更高（[python.org](https://www.python.org/downloads/) 版本，安装时勾选 *Add Python to PATH*） |
-| 浏览器 | Microsoft Edge（系统自带即可） |
-| 账号 | 米游社账号，且账号下有对应游戏的角色 |
+| 项目 | 源码版 | 便携版 |
+| --- | --- | --- |
+| 操作系统 | Windows 10 / 11 | 同左 |
+| Python | **需要 3.10+**（[python.org](https://www.python.org/downloads/) 版本，安装时勾选 *Add Python to PATH*） | **不需要**（已内置） |
+| 浏览器 | Microsoft Edge（系统自带即可） | 同左 |
+| 账号 | 米游社账号，且账号下有对应游戏的角色 | 同左 |
 
 > 目前只支持国服（米游社的米哈游国服接口）。国际服 HoYoLAB
 > 需要另一套凭据，暂未适配。
@@ -45,7 +45,16 @@ Windows 计划任务每天在后台静默完成，奖励直接进游戏邮箱。
 
 ## 安装
 
-### 方式一：下载后一键安装（推荐）
+### 方式零：便携版（不想装 Python 就选这个）
+
+到 [Releases](https://github.com/mxf133/mys-signin-helper/releases/latest) 下载
+**`米游社签到助手-vX.Y.Z-便携版.zip`**，解压后双击 **`米游社签到助手.exe`** 即可。
+
+- 免安装、免配环境，解压到桌面或 D 盘都能直接跑
+- **别放在 `C:\Program Files` 这类受保护目录**，否则凭据和日志写不进去
+- 出问题就双击 **`自检.bat`**，会生成并打开一份「自检报告.txt」
+
+### 方式一：下载源码后一键安装
 
 1. 点右上角 **Code → Download ZIP**，解压到任意目录（路径不要有中文以外的特殊字符）
 2. 双击 **`安装依赖.bat`** —— 会自动创建 `.venv` 并装好依赖
@@ -120,9 +129,40 @@ python -m venv .venv
 .venv\Scripts\python.exe cli.py status                 :: 查询状态
 .venv\Scripts\python.exe cli.py task                   :: 注册计划任务
 .venv\Scripts\python.exe cli.py untask                 :: 删除计划任务
+.venv\Scripts\python.exe cli.py doctor                 :: 环境自检
 ```
 
 `--game` 取值：`all`（默认）、`genshin`（原神）、`starrail`（崩坏：星穹铁道）。
+
+**便携版**把图形界面和命令行合在同一个 exe 里，把上面命令里的
+`python cli.py` 换成 exe 本身即可：
+
+```bat
+米游社签到助手.exe sign
+米游社签到助手.exe doctor --show    :: 自检并自动打开报告
+```
+
+### 环境自检（doctor）
+
+排错先跑这个。会逐项检查运行模式、程序目录是否可写、Edge 是否找得到、
+`genshin.py` / `playwright` 是否可用（**会真的启动一次无头 Edge 验证**）、
+凭据状态、计划任务状态，并把结果存成 `自检报告.txt`。
+
+---
+
+## 打包便携版
+
+仓库里带了打包脚本，可以自己重新生成免安装版：
+
+```bat
+.venv\Scripts\python.exe build_portable.py
+```
+
+产物在 `dist_portable\米游社签到助手-v<版本>-便携版.zip`。
+
+脚本会先把源码复制到一个临时目录再交给 PyInstaller —— 这样能确保
+`cookie.enc`、`.edge_profile\`、`signin.log` 这类私有文件**不会**被打进发行包，
+也顺便避开中文路径在工具链里的编码问题。
 
 ---
 
@@ -131,11 +171,12 @@ python -m venv .venv
 **仓库里的文件：**
 
 ```
-├─ app.pyw                  图形界面主程序
+├─ app.pyw                  图形界面主程序（便携版里也兼命令行入口）
 ├─ core.py                  核心逻辑（登录 / 多游戏签到 / 计划任务 / DPAPI）
 ├─ cli.py                   命令行入口（计划任务调用的就是它）
 ├─ 启动米游社签到助手.bat      启动界面
 ├─ 安装依赖.bat              创建 .venv 并安装依赖
+├─ build_portable.py        打包免安装便携版
 ├─ requirements.txt         依赖清单
 ├─ icon.ico / icon.png      程序图标（16~256px 七档）
 ├─ screenshot.png           界面预览
@@ -147,12 +188,13 @@ python -m venv .venv
 **首次运行后会在本目录生成（已被 `.gitignore` 排除，不会提交）：**
 
 ```
-├─ .venv\                   Python 运行环境
+├─ .venv\                   Python 运行环境（便携版没有）
 ├─ cookie.enc               加密后的登录凭据
 ├─ .edge_profile\           Edge 登录会话缓存
 ├─ signin.log               运行日志
 ├─ state.json               各游戏最近一次签到状态
-└─ settings.json            界面设置（自动签到时间）
+├─ settings.json            界面设置（自动签到时间）
+└─ 自检报告.txt              doctor 自检的输出
 ```
 
 ---
@@ -168,8 +210,9 @@ python -m venv .venv
   **想加新游戏只需往 `GAMES` 表里加一行**（`genshin.py` 还支持崩坏3、绝区零）。
 - **凭据存储**：`cookie.enc`，使用 Windows DPAPI 加密，只有当前 Windows 用户
   能解密，换用户或换机器都无效。
-- **定时**：注册名为 `MYS-DailySignIn` 的 Windows 计划任务，用 `pythonw.exe`
-  执行，因此不会弹黑色命令行窗口。
+- **定时**：注册名为 `MYS-DailySignIn` 的 Windows 计划任务。源码模式用
+  `pythonw.exe` 执行（不会弹黑色命令行窗口），便携版直接让 exe 带 `sign`
+  参数跑，因此任务用的是同一个可执行文件。
 - **高分屏适配**：启动时先声明 DPI 感知（`SetProcessDpiAwarenessContext`，
   失败则退到 `shcore` / `user32` 的老接口），再按真实 DPI 设置 `tk scaling`
   并用 `px()` 换算所有布局像素。不这么做的话，Windows 会把整个窗口当位图
@@ -182,6 +225,37 @@ python -m venv .venv
 ---
 
 ## 更新日志
+
+### v2.1.0
+
+**新增免安装便携版** —— 不再需要自己装 Python：
+
+- 到 Releases 下载 `米游社签到助手-vX.Y.Z-便携版.zip`，解压双击 exe 即可。
+  目标机器只需要有 Microsoft Edge（Win10/11 默认自带）。
+- 仓库里附了打包脚本 `build_portable.py`，可自行重新生成。
+- 体积说明：解压后约 148 MB，压缩包约 61 MB。大头是 Playwright 自带的
+  浏览器驱动（106 MB），否则没法驱动 Edge 完成登录。
+
+**新增环境自检 `doctor`** —— 出问题时先跑这个：
+
+```bat
+.venv\Scripts\python.exe cli.py doctor        :: 源码版
+米游社签到助手.exe doctor --show               :: 便携版（自检完自动打开报告）
+```
+
+会逐项检查运行模式、程序目录是否可写、Edge 是否找得到、
+`genshin.py` / `playwright` 是否可用（**会真的启动一次无头 Edge 验证**，
+这是最容易在打包后失效的一环）、凭据状态、计划任务状态，
+并把结果存成 `自检报告.txt`。便携版里也有 `自检.bat` 一键调用。
+
+**便携版的适配改动**（对源码版行为无影响）：
+
+- 程序数据目录不再用 `__file__` —— 打包后 `__file__` 指向 PyInstaller
+  的临时解包目录，凭据和日志会在退出时凭空消失；现在冻结模式下改用
+  exe 所在目录。
+- 计划任务命令在打包模式下改为直接调用 exe 自身（`"...\米游社签到助手.exe" sign`）。
+- `app.pyw` 兼作命令行入口：带 `login` / `sign` / `status` / `task` /
+  `untask` / `doctor` 参数时不开窗口，直接走命令行逻辑。
 
 ### v2.0.1
 
@@ -245,7 +319,20 @@ cookie 有有效期（通常一个月左右）。重新点一次【登录米游�
 
 **Q：换了电脑 / 重装了系统？**
 `cookie.enc` 依赖当前 Windows 用户的密钥，换环境后必须重新登录一次。
-新机器上先双击 `安装依赖.bat` 重建环境。
+新机器上源码版先双击 `安装依赖.bat` 重建环境，便携版直接解压就能用。
+
+**Q：便携版启动很慢 / 杀毒软件报毒？**
+第一次启动要解压上百 MB 的文件，稍慢是正常的。PyInstaller 打的包偶尔会被
+杀毒软件误报（因为它是"自解压 + 释放可执行文件"的行为模式），加白名单即可；
+介意的话用源码版。
+
+**Q：便携版报"目录不可写"？**
+别把它放在 `C:\Program Files`、`C:\Windows` 这类受保护目录，放到桌面、
+文档或 D 盘即可。相关检查会出现在 `自检报告.txt` 里。
+
+**Q：界面上的按钮点了没反应 / 想知道到底哪一步坏了？**
+先跑自检：源码版 `.venv\Scripts\python.exe cli.py doctor`，
+便携版双击 `自检.bat`。
 
 **Q：想改自动签到时间？**
 界面上改时间后点【开启 / 更新】即可覆盖旧任务。
@@ -282,6 +369,7 @@ cookie 有有效期（通常一个月左右）。重新点一次【登录米游�
 具体来说，从最初的米游社接口调研、`genshin.py` 选型，到 DPAPI 凭据加密、
 Playwright 内嵌登录、多游戏 `GAMES` 注册表重构、4K 高分屏 DPI 修复，
 再到银狼图标的裁切与 ICO 打包（7 档手写，省掉约 60% 体积），
+以及 v2.1.0 的 PyInstaller 便携版打包与 `doctor` 环境自检，
 均为 AI 生成并由维护者测试验收。
 
 仓库地址：<https://github.com/mxf133/mys-signin-helper>

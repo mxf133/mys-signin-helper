@@ -21,7 +21,7 @@ from pathlib import Path
 BASE = Path(__file__).resolve().parent
 APP_TITLE = "米游社签到助手"
 APP_SUB = "原神 · 崩坏：星穹铁道 · 米游社每日签到"
-VERSION = "2.0.1"
+VERSION = "2.1.0"
 
 # 4K 屏上 Windows 缩放常为 150%~200%。进程若未声明 DPI 感知，系统会把整个
 # 窗口当位图放大——字体边缘被插值糊掉，这是界面发虚的根因。
@@ -88,7 +88,11 @@ def _in_project_venv() -> bool:
     不能比较可执行文件名：`.venv\\Scripts` 下 python.exe 和 pythonw.exe 并存，
     手动调试用 python.exe、计划任务用 pythonw.exe，一比文件名就永远判定
     "环境不对"，于是每次启动都白白多起一个进程在外面干等。
+
+    打包成 exe 后解释器和依赖都已内置，没有再切换环境的余地。
     """
+    if getattr(sys, "frozen", False):
+        return True
     try:
         if os.path.normcase(str(Path(sys.prefix).resolve())) == \
            os.path.normcase(str((BASE / ".venv").resolve())):
@@ -621,7 +625,17 @@ class App:
         self.set_status("日志已清空", SUBTEXT)
 
 
+# 便携版把图形界面与命令行合在同一个 exe 里：带这些参数时不建窗口，
+# 直接走命令行逻辑。Windows 计划任务就是用 `exe sign` 把签到调起来的。
+CLI_ACTIONS = ("login", "sign", "status", "task", "untask", "doctor")
+
+
 def main():
+    argv = sys.argv[1:]
+    if argv and argv[0] in CLI_ACTIONS:
+        import cli
+        cli.main()
+        return
     root = tk.Tk()
     # 让 Tk 按真实 DPI 换算字号（Tk 的 scaling 单位是"每点像素数"，即 DPI/72）。
     # 不设的话 Tk 会以为自己是 96 DPI，字全部偏小。
