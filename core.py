@@ -574,6 +574,74 @@ def task_command() -> str:
     return '"%s" "%s" sign' % (py, BASE / "cli.py")
 
 
+def task_action() -> tuple:
+    """计划任务的 (程序, 参数)，供 XML 注册使用（路径含空格也安全）。"""
+    if is_frozen():
+        return sys.executable, "sign"
+    pw = BASE / ".venv" / "Scripts" / "pythonw.exe"
+    py = str(pw) if pw.exists() else sys.executable
+    return py, '"%s" sign' % (BASE / "cli.py")
+
+
+def _xml_escape(s: str) -> str:
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+# 注册计划任务用的 XML 模板。不用 schtasks /TR 命令行方式，是因为那样建出的
+# 任务带一组对"每日签到"很不友好的默认开关：
+#   StartWhenAvailable=false   电脑关机/睡眠错过触发点后，开机也不补跑
+#   DisallowStartIfOnBatteries=true / StopIfGoingOnBatteries=true  电池不跑
+#   WakeToRun=false            睡眠不唤醒（保持默认，唤醒副作用多）
+# XML 里显式把前三个配成对签到友好的值：错过后下次开机尽快补跑一次，电池也跑。
+_TASK_XML = """<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <Triggers>
+    <CalendarTrigger>
+      <StartBoundary>%(start)s</StartBoundary>
+      <Enabled>true</Enabled>
+      <ScheduleByDay>
+        <DaysInterval>1</DaysInterval>
+      </ScheduleByDay>
+    </CalendarTrigger>
+  </Triggers>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <Duration>PT10M</Duration>
+      <WaitTimeout>PT1H</WaitTimeout>
+      <StopOnIdleEnd>true</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT1H</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>%(command)s</Command>
+      <Arguments>%(arguments)s</Arguments>
+    </Exec>
+  </Actions>
+  <Principals>
+    <Principal id="Author">
+      <UserId>%(user)s</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+</Task>
+"""
+
+
 def _query(name: str) -> bool:
     try:
         r = subprocess.run(["schtasks", "/Query", "/TN", name],
@@ -633,18 +701,36 @@ def create_task(time_str: str = "09:05", on_log=None) -> dict:
             except Exception:
                 pass
 
+    cmd, args = task_action()
+    xml_text = _TASK_XML % {
+        "start": datetime.now().strftime("%Y-%m-%d") + "T" + time_str + ":00",
+        "command": _xml_escape(cmd),
+        "arguments": _xml_escape(args),
+        "user": "%s\\%s" % (os.environ.get("USERDOMAIN", ""),
+                            os.environ.get("USERNAME", "")),
+    }
+
+    import tempfile
+    fd, xml_path = tempfile.mkstemp(suffix=".xml", prefix="mys-task-")
     try:
-        r = subprocess.run(
-            ["schtasks", "/Create", "/TN", TASK_NAME, "/TR", task_command(),
-             "/SC", "DAILY", "/ST", time_str, "/F", "/RL", "LIMITED"],
-            capture_output=True, text=True, encoding="gbk", errors="replace")
-    except Exception as e:
-        msg = ("无法调用系统计划任务命令 schtasks（%s: %s）。"
-               "可能是安全软件或系统策略限制了该命令，"
-               "可以改用「任务计划程序」手动创建，指向 %s"
-               % (type(e).__name__, e, task_command()))
-        emit(msg)
-        return {"ok": False, "message": msg}
+        with os.fdopen(fd, "w", encoding="utf-16") as f:
+            f.write(xml_text)
+        try:
+            r = subprocess.run(
+                ["schtasks", "/Create", "/TN", TASK_NAME, "/XML", xml_path, "/F"],
+                capture_output=True, text=True, encoding="gbk", errors="replace")
+        except Exception as e:
+            msg = ("无法调用系统计划任务命令 schtasks（%s: %s）。"
+                   "可能是安全软件或系统策略限制了该命令，"
+                   "可以改用「任务计划程序」手动创建，指向 %s"
+                   % (type(e).__name__, e, task_command()))
+            emit(msg)
+            return {"ok": False, "message": msg}
+    finally:
+        try:
+            os.remove(xml_path)
+        except OSError:
+            pass
 
     if r.returncode == 0:
         save_settings(task_time=time_str)
