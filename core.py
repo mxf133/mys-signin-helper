@@ -53,14 +53,17 @@ LOGIN_URL = "https://www.miyoushe.com/sr/"
 TASK_NAME = "MYS-DailySignIn"
 LEGACY_TASK_NAMES = ("HSR-DailySignIn",)
 
-DEFAULT_SETTINGS = {"task_time": "09:05"}
+DEFAULT_SETTINGS = {"task_time": "09:05", "selected_games": None}
 MAX_LOG_LINES = 400
 
 # 支持的游戏：key 内部标识，enum 对应 genshin.Game 成员名，
-# signgame 即米哈游接口的 x-rpc-signgame 头（展示/排错用）
+# signgame 即米哈游接口的 x-rpc-signgame 头（展示/排错用）。
+# 注意 signgame 的取值来自 genshin 库 daily.py 里的硬映射，不是 Game 的 value：
+# GENSHIN->hk4e、STARRAIL->hkrpg、ZZZ->zzz。
 GAMES = (
     {"key": "genshin", "name": "原神", "enum": "GENSHIN", "signgame": "hk4e"},
     {"key": "starrail", "name": "崩坏：星穹铁道", "enum": "STARRAIL", "signgame": "hkrpg"},
+    {"key": "zzz", "name": "绝区零", "enum": "ZZZ", "signgame": "zzz"},
 )
 GAME_KEYS = tuple(g["key"] for g in GAMES)
 GAME_BY_KEY = {g["key"]: g for g in GAMES}
@@ -150,6 +153,28 @@ def save_settings(**kw) -> dict:
     s.update(kw)
     _write_json(SETTINGS_FILE, s)
     return s
+
+
+def selected_games() -> list:
+    """用户勾选要签到的游戏 key 列表（存在 settings.json）。
+
+    三重兜底，保证任何情况下都返回一个非空且合法的列表：
+    非列表（None / 字符串）、含未知 key、空列表 —— 一律退回"全部游戏"。
+    这样旧版 settings.json（压根没有这个键）升级上来也天然是全选。
+    """
+    raw = load_settings().get("selected_games")
+    if not isinstance(raw, list):
+        return list(GAME_KEYS)
+    keys = [k for k in GAME_KEYS if k in raw]   # 按 GAMES 顺序，顺带滤掉未知 key
+    return keys or list(GAME_KEYS)
+
+
+def save_selected_games(keys) -> list:
+    keys = [k for k in GAME_KEYS if k in (keys or [])]
+    if not keys:
+        keys = list(GAME_KEYS)      # 一个都不选等于全选，避免出现"什么都不签"
+    save_settings(selected_games=keys)
+    return keys
 
 
 def load_state() -> dict:
@@ -516,9 +541,10 @@ async def _sign_many_async(game_keys, force_info: bool, on_log) -> dict:
 def sign_once(game_keys=None, force_info: bool = False, on_log=None) -> dict:
     """执行签到（force_info=True 时只查询状态，不重复签）。
 
-    game_keys 为空表示全部游戏。返回 {"ok": bool, "games": {key: 结果}}。
+    game_keys 为空表示按用户在界面上勾选的游戏（默认全部）。
+    返回 {"ok": bool, "games": {key: 结果}}。
     """
-    keys = tuple(game_keys) if game_keys else GAME_KEYS
+    keys = tuple(game_keys) if game_keys else tuple(selected_games())
     keys = tuple(k for k in keys if k in GAME_BY_KEY)
     try:
         games = asyncio.run(_sign_many_async(keys, force_info, on_log))
@@ -793,9 +819,14 @@ def local_state() -> dict:
     if cred_flag is None:
         cred_flag = CRED_FILE.exists()   # 兼容早期没有该字段的 state.json
 
+    sel = selected_games()
+    for g in detail:
+        g["selected"] = g["key"] in sel
+
     return {
         "cred_ok": bool(cred_flag) and CRED_FILE.exists(),
         "login_time": st.get("login_time"),
         "task_time": settings.get("task_time", "09:05"),
+        "selected": sel,
         "game_list": detail,
     }

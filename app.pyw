@@ -20,8 +20,8 @@ from pathlib import Path
 
 BASE = Path(__file__).resolve().parent
 APP_TITLE = "米游社签到助手"
-APP_SUB = "原神 · 崩坏：星穹铁道 · 米游社每日签到"
-VERSION = "2.1.1"
+APP_SUB = "原神 · 崩坏：星穹铁道 · 绝区零 · 米游社每日签到"
+VERSION = "2.2.0"
 
 # 4K 屏上 Windows 缩放常为 150%~200%。进程若未声明 DPI 感知，系统会把整个
 # 窗口当位图放大——字体边缘被插值糊掉，这是界面发虚的根因。
@@ -133,6 +133,7 @@ CARD = "#ffffff"
 BORDER = "#e2e5ea"
 TEXT = "#1f2329"
 SUBTEXT = "#8b919b"
+HINT = "#b6bac2"        # 比 SUBTEXT 更淡，用于"已取消勾选"这类弱化文字
 ACCENT = "#6d5ae6"
 ACCENT_D = "#5b48d9"
 ACCENT_A = "#4b3ac8"
@@ -218,12 +219,13 @@ class Btn(tk.Button):
 
 
 class GameCard(tk.Frame):
-    """单个游戏的签到状态卡片。"""
+    """单个游戏的签到状态卡片（带"是否参与签到"勾选框）。"""
 
-    def __init__(self, master, game_key, game_name, on_sign):
+    def __init__(self, master, game_key, game_name, on_sign, on_toggle):
         super().__init__(master, bg=CARD, highlightbackground=BORDER,
                          highlightthickness=px(1), bd=0)
         self.game_key = game_key
+        self.on_toggle = on_toggle
 
         head = tk.Frame(self, bg=CARD)
         head.pack(fill="x", padx=px(16), pady=(px(12), 0))
@@ -238,8 +240,16 @@ class GameCard(tk.Frame):
         self.uid = tk.Label(head, text="", bg=CARD, fg=SUBTEXT, font=F_SMALL)
         self.uid.pack(side="right")
 
+        self.picked = tk.BooleanVar(value=True)
+        self.chk = tk.Checkbutton(
+            self, text="参与签到", variable=self.picked, command=self._toggled,
+            bg=CARD, fg=SUBTEXT, font=F_SMALL, activebackground=CARD,
+            activeforeground=TEXT, selectcolor=CARD, bd=0,
+            highlightthickness=0, cursor="hand2", anchor="w")
+        self.chk.pack(fill="x", padx=px(12), pady=(px(6), 0))
+
         tk.Frame(self, bg=BORDER, height=px(1)).pack(
-            fill="x", padx=px(16), pady=(px(9), px(7)))
+            fill="x", padx=px(16), pady=(px(7), px(7)))
 
         self.v_today = self._row("今日签到")
         self.v_days = self._row("本月累计")
@@ -251,6 +261,21 @@ class GameCard(tk.Frame):
         self.btn = Btn(foot, "单独签到", lambda: on_sign(game_key),
                        kind="secondary", padx=12, pady=4)
         self.btn.pack(side="right")
+
+    def _toggled(self):
+        if self.on_toggle:
+            self.on_toggle(self.game_key, self.picked.get())
+
+    def set_selected(self, flag):
+        """由外部同步勾选状态，且不触发回调（避免回写时再存一次）。"""
+        self.picked.set(bool(flag))
+        self._apply_picked()
+
+    def _apply_picked(self):
+        """未参与签到的卡片整体压暗，一眼能看出哪些游戏不会被签。"""
+        on = self.picked.get()
+        self.chk.configure(fg=SUBTEXT if on else HINT)
+        self.btn.configure(state="normal" if on else "disabled")
 
     def _row(self, label):
         r = tk.Frame(self, bg=CARD)
@@ -343,12 +368,22 @@ class App:
         tk.Frame(r, bg=BORDER, height=px(1)).grid(row=0, column=0, sticky="sew")
 
         # ---- 各游戏状态卡片
+        sel_bar = tk.Frame(r, bg=BG)
+        sel_bar.grid(row=1, column=0, sticky="ew", padx=px(18), pady=(px(14), 0))
+        tk.Label(sel_bar, text="勾选要签到的游戏", bg=BG, fg=SUBTEXT,
+                 font=F_SMALL).pack(side="left")
+        Btn(sel_bar, "全选", lambda: self.set_all_games(True),
+            kind="secondary", padx=10, pady=2).pack(side="right")
+        Btn(sel_bar, "全不选", lambda: self.set_all_games(False),
+            kind="secondary", padx=10, pady=2).pack(side="right", padx=(0, px(6)))
+
         cards = tk.Frame(r, bg=BG)
-        cards.grid(row=1, column=0, sticky="ew", padx=px(18), pady=(px(16), 0))
+        cards.grid(row=2, column=0, sticky="ew", padx=px(18), pady=(px(8), 0))
         for i in range(len(core.GAMES)):
             cards.columnconfigure(i, weight=1, uniform="game")
         for i, cfg in enumerate(core.GAMES):
-            card = GameCard(cards, cfg["key"], cfg["name"], self.do_sign_one)
+            card = GameCard(cards, cfg["key"], cfg["name"], self.do_sign_one,
+                            self.on_game_toggled)
             card.grid(row=0, column=i, sticky="nsew",
                       padx=(0, px(8)) if i == 0 else (px(8), 0))
             self.cards[cfg["key"]] = card
@@ -357,7 +392,7 @@ class App:
         # ---- 操作区
         ops = tk.Frame(r, bg=CARD, highlightbackground=BORDER,
                        highlightthickness=px(1))
-        ops.grid(row=2, column=0, sticky="ew", padx=px(18), pady=(px(16), 0))
+        ops.grid(row=3, column=0, sticky="ew", padx=px(18), pady=(px(16), 0))
         tk.Label(ops, text="操作", bg=CARD, fg=TEXT, font=F_SECTION,
                  anchor="w").pack(anchor="w", padx=px(18), pady=(px(12), px(8)))
 
@@ -520,6 +555,7 @@ class App:
             card = self.cards.get(data["key"])
             if card:
                 card.set(data)
+                card.set_selected(data.get("selected", True))
 
         login_time = st.get("login_time")
         if st.get("cred_ok"):
@@ -571,7 +607,41 @@ class App:
 
     # ------------------------------------------------------------ 具体动作
     def do_sign_all(self):
-        self.run_bg(lambda: core.sign_once(None, False, self._log_cb), "全部签到完成")
+        picked = core.selected_games()
+        if len(picked) == 1:
+            label = "%s 签到完成" % core.game_name(picked[0])
+        else:
+            label = "%d 个游戏签到完成" % len(picked)
+        self.run_bg(lambda: core.sign_once(None, False, self._log_cb), label)
+
+    def on_game_toggled(self, key, flag):
+        """勾选框变动：立刻落盘 + 刷新卡片样式（下次签到/定时任务都用这个选择）。"""
+        card = self.cards.get(key)
+        if not any(c.picked.get() for c in self.cards.values()):
+            # 不允许一个都不选：把刚取消的这个勾回去，并提示
+            if card:
+                card.set_selected(True)
+            self.set_status("至少要保留一个游戏，已还原", WARN)
+            return
+        if card:
+            card._apply_picked()
+        picked = [k for k in core.GAME_KEYS if self.cards[k].picked.get()]
+        core.save_selected_games(picked)
+        self.set_status("将签到：%s"
+                        % "、".join(core.game_name(k) for k in core.selected_games()),
+                        SUBTEXT)
+
+    def set_all_games(self, flag):
+        """全选 / 全不选。全不选没有意义，直接提示并忽略。"""
+        if not flag:
+            self.set_status("至少要保留一个游戏", WARN)
+            return
+        for card in self.cards.values():
+            card.set_selected(True)
+        core.save_selected_games(list(core.GAME_KEYS))
+        self.set_status("将签到：%s"
+                        % "、".join(core.game_name(k) for k in core.GAME_KEYS),
+                        SUBTEXT)
 
     def do_sign_one(self, key):
         name = core.game_name(key)

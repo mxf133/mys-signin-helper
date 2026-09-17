@@ -3,14 +3,16 @@
 
 用法:
     python cli.py login              打开 Edge 登录米游社，凭据加密保存（只需一次）
-    python cli.py sign               签到全部游戏（Windows 计划任务调用这个）
-    python cli.py sign --game 原神    只签某一个游戏
+    python cli.py sign               签到（按界面里勾选的游戏；默认全部）
+    python cli.py sign --game zzz     只签某一个游戏
+    python cli.py sign --game genshin --game zzz   同时签指定的几个游戏
     python cli.py status             查询签到状态，不重复签到
-    python cli.py task               注册计划任务（每天 09:05 自动签到）
+    python cli.py task               注册计划任务（按 settings.json 里的时间自动签到）
     python cli.py untask             删除计划任务
     python cli.py doctor             环境自检（排查问题时跑这个）
 
---game 可用值：all（默认）、genshin（原神）、starrail（崩坏：星穹铁道）。
+--game 可用值：genshin（原神）、starrail（崩坏：星穹铁道）、zzz（绝区零）、
+all（默认，表示按界面上勾选的游戏）。可重复传入以指定多个。
 图形界面请直接运行 app.pyw。
 
 便携版（打包成 exe）用法相同，把 `python cli.py` 换成 exe 本身即可，
@@ -211,19 +213,28 @@ def open_report(report: Path):
 
 def main():
     core.ensure_std_streams()
-    ap = argparse.ArgumentParser(description="米游社每日签到（原神 / 崩坏：星穹铁道）")
+    ap = argparse.ArgumentParser(
+        description="米游社每日签到（原神 / 崩坏：星穹铁道 / 绝区零）")
     ap.add_argument("action",
                     choices=["login", "sign", "status", "task", "untask", "doctor"],
                     help="login=登录一次  sign=签到  status=查看状态  "
                          "task=注册定时任务  untask=删除定时任务  doctor=环境自检")
-    ap.add_argument("--game", default="all",
+    ap.add_argument("--game", action="append", default=None,
                     choices=["all"] + list(core.GAME_KEYS),
-                    help="指定游戏，默认 all（全部）")
+                    help="指定游戏，可重复传入（如 --game genshin --game zzz）；"
+                         "不传或传 all 表示按界面里勾选的游戏")
     ap.add_argument("--show", action="store_true",
                     help="仅用于 doctor：自检完自动打开报告文件")
     args = ap.parse_args()
 
-    keys = None if args.game == "all" else [args.game]
+    if not args.game or "all" in args.game:
+        keys = None                      # None = 跟随界面勾选（默认全部）
+    else:
+        seen, keys = set(), []
+        for k in args.game:              # 去重且保持传入顺序
+            if k not in seen:
+                seen.add(k)
+                keys.append(k)
 
     if args.action == "login":
         res = core.login()
