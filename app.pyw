@@ -21,7 +21,7 @@ from pathlib import Path
 BASE = Path(__file__).resolve().parent
 APP_TITLE = "米游社签到助手"
 APP_SUB = "原神 · 崩坏：星穹铁道 · 绝区零 · 米游社每日签到"
-VERSION = "2.2.0"
+VERSION = "2.2.1"
 
 # 4K 屏上 Windows 缩放常为 150%~200%。进程若未声明 DPI 感知，系统会把整个
 # 窗口当位图放大——字体边缘被插值糊掉，这是界面发虚的根因。
@@ -346,7 +346,7 @@ class App:
         self._set_icon()
 
         r.columnconfigure(0, weight=1)
-        r.rowconfigure(3, weight=1)
+        r.rowconfigure(4, weight=1)
 
         # ---- 顶部标题栏
         head = tk.Frame(r, bg=CARD)
@@ -428,7 +428,7 @@ class App:
         # ---- 日志区
         logf = tk.Frame(r, bg=CARD, highlightbackground=BORDER,
                         highlightthickness=px(1))
-        logf.grid(row=3, column=0, sticky="nsew", padx=px(18), pady=(px(16), 0))
+        logf.grid(row=4, column=0, sticky="nsew", padx=px(18), pady=(px(16), 0))
         logf.columnconfigure(0, weight=1)
         logf.rowconfigure(1, weight=1)
 
@@ -456,7 +456,7 @@ class App:
 
         # ---- 状态栏
         foot = tk.Frame(r, bg=BG)
-        foot.grid(row=4, column=0, sticky="ew", padx=px(20), pady=(px(8), px(12)))
+        foot.grid(row=5, column=0, sticky="ew", padx=px(20), pady=(px(8), px(12)))
         self.status = tk.Label(foot, text="就绪", bg=BG, fg=SUBTEXT,
                                font=F_SMALL, anchor="w")
         self.status.pack(side="left")
