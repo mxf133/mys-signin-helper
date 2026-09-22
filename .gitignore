@@ -57,3 +57,6 @@ _*.txt
 _*.png
 _*.log
 *.tmp
+
+# 换图标前留的旧版备份
+backup/
