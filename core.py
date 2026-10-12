@@ -1678,10 +1678,14 @@ def run_elevated(parameters: str, timeout_sec: int = 180) -> tuple:
     在 UAC 窗口确认。
     返回 (是否成功, 说明)；用户点了"否"时说明里会带 ERROR_CANCELLED。
     """
+    exe = _pythonw_exe() or sys.executable
+    return run_elevated_exe(exe, '"%s" %s' % (BASE / "cli.py", parameters), timeout_sec)
+
+
+def run_elevated_exe(exe: str, parameters: str, timeout_sec: int = 180) -> tuple:
+    """用管理员权限运行指定程序（ShellExecuteExW "runas"，会弹一次 UAC）并等它结束。"""
     if sys.platform != "win32":
         return False, "仅支持 Windows"
-    exe = _pythonw_exe() or sys.executable
-    cli = BASE / "cli.py"
     try:
         from ctypes import wintypes
 
@@ -1710,7 +1714,7 @@ def run_elevated(parameters: str, timeout_sec: int = 180) -> tuple:
         info.fMask = 0x00000040                      # SEE_MASK_NOCLOSEPROCESS
         info.lpVerb = "runas"
         info.lpFile = str(exe)
-        info.lpParameters = '"%s" %s' % (cli, parameters)
+        info.lpParameters = parameters
         info.lpDirectory = str(BASE)
         info.nShow = 1                               # SW_SHOWNORMAL
         if not shell32.ShellExecuteExW(ctypes.byref(info)):
@@ -1722,6 +1726,83 @@ def run_elevated(parameters: str, timeout_sec: int = 180) -> tuple:
         return True, "提权命令已执行完"
     except Exception as e:
         return False, "提权失败：%s: %s" % (type(e).__name__, e)
+
+
+# ---- 通知助手：定位 / 状态 / 一键启用 -------------------------------------
+
+NOTIFY_HELPER_DIRS = ("通知助手", ".toast_pkg/toast_helper")
+HELPER_RESULT_FILE = (Path(os.environ.get("LOCALAPPDATA", ""))
+                      / "MiyousheSignInAssistant" / "register.result")
+
+
+def toast_helper_exe() -> Path:
+    """找随程序分发的"通知助手"可执行文件（便携版 / 源码构建两种布局）。"""
+    for rel in NOTIFY_HELPER_DIRS:
+        p = BASE / rel / "toast_helper.exe"
+        if p.exists():
+            return p
+    return BASE / NOTIFY_HELPER_DIRS[0] / "toast_helper.exe"
+
+
+def toast_registered() -> bool:
+    """通知助手是否已经注册成"已安装应用"（只有这样才发得出真通知）。"""
+    return toast_alias().exists()
+
+
+def setup_toast(on_log=None) -> dict:
+    """一键启用真正的系统通知：把随程序分发的通知助手注册成已安装应用。
+
+    需要一次管理员权限（UAC）：
+      · 助手会把自己复制到 %LOCALAPPDATA%\\MiyousheSignInAssistant\\pkg（稳定位置，
+        便携版文件夹之后可以随便搬动）
+      · 需要时打开 Windows「开发者模式」（免签名松散注册的前提）
+      · 用 WinRT 的 PackageManager 注册，成功后系统通知即可用
+    不想用了：`python build_toast_package.py --uninstall`，或在「设置 → 应用」里
+    卸载"米游社签到助手"。
+    """
+    emit = _emit_factory(on_log)
+    if toast_registered():
+        return {"ok": True, "already": True, "message": "系统通知已经可用"}
+    helper = toast_helper_exe()
+    if not helper.exists():
+        msg = ("这个版本里没有带通知助手，无法启用系统通知"
+               "（便携版请用 v3.0.1 及以后的包；源码版可运行 build_toast_package.py 构建）")
+        emit(msg)
+        return {"ok": False, "message": msg}
+
+    emit("正在启用系统通知：会弹一次管理员权限（UAC），请点【是】。\n"
+         "这一步只做两件事：① 在需要时打开 Windows「开发者模式」"
+         "（免签名注册应用的前提，可随时关掉）；\n"
+         "② 把通知助手注册成已安装应用，文件放在 %LOCALAPPDATA%\\MiyousheSignInAssistant"
+         "，随时可卸载。")
+    try:
+        HELPER_RESULT_FILE.unlink()
+    except OSError:
+        pass
+    ok, detail = run_elevated_exe(str(helper), "--register-self", timeout_sec=300)
+    if not ok:
+        emit(detail)
+        return {"ok": False, "message": detail}
+
+    result = ""
+    try:
+        result = HELPER_RESULT_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        pass
+    if not result and toast_registered():
+        result = "MYS-REGISTER:ok"
+    if result.startswith("MYS-REGISTER:ok"):
+        msg = "系统通知已启用：以后签到失败会弹出真正的 Windows 通知（右下角 + 通知中心）"
+        emit(msg)
+        return {"ok": True, "message": msg}
+    if "need-admin" in result:
+        msg = "注册需要管理员权限，但这次没有获得（UAC 被取消或失败）"
+    elif result.startswith("MYS-REGISTER:failed"):
+        msg = "注册失败：%s" % result.split(":", 2)[-1][:160]
+    else:
+        msg = "注册没成功（助手没有返回结果；可看运行日志或重试一次）"
+    emit(msg)
+    return {"ok": False, "message": msg}
 
 
 def create_task_elevated(time_str: str = "09:05", on_log=None) -> dict:

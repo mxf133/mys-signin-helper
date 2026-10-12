@@ -223,7 +223,8 @@ def main():
     ap = argparse.ArgumentParser(
         description="米游社每日签到（原神 / 崩坏：星穹铁道 / 绝区零）")
     ap.add_argument("action",
-                    choices=["login", "sign", "status", "task", "untask", "doctor"],
+                    choices=["login", "sign", "status", "task", "untask", "doctor",
+                             "notify-setup"],
                     help="login=登录一次  sign=签到  status=查看状态  "
                          "task=注册定时任务  untask=删除定时任务  doctor=环境自检")
     ap.add_argument("--game", action="append", default=None,
@@ -269,6 +270,10 @@ def main():
     elif args.action == "untask":
         res = core.delete_task()
         core.write_task_result(res)
+        sys.exit(0 if res.get("ok") else 1)
+    elif args.action == "notify-setup":
+        # 一键启用真正的系统通知（注册通知助手；需要一次管理员权限）
+        res = core.setup_toast(lambda m: print(m))
         sys.exit(0 if res.get("ok") else 1)
     elif args.action == "doctor":
         report = doctor()

@@ -39,13 +39,21 @@ BUILD_DIR = BASE / ".toast_build"
 # 软件管制的机器上临时目录常常不可写，会直接弹 "Could not create temporary
 # directory!"。onedir 免解压，启动更快也更稳。
 HELPER_SUBDIR = "toast_helper"
+# 助手的目录本身就是"可注册的布局根"：exe + _internal + AppxManifest.xml + 图标，
+# 这样它能自己把自己注册成已安装应用（--register-self），便携版也靠它。
 HELPER_REL = HELPER_SUBDIR + "\\toast_helper.exe"
 HELPER_EXE = PKG_DIR / HELPER_SUBDIR / "toast_helper.exe"
+LAYOUT_DIR = PKG_DIR / HELPER_SUBDIR
+LAYOUT_MANIFEST = LAYOUT_DIR / "AppxManifest.xml"
 ALIAS = "miyoushe-toast.exe"
 PKG_NAME = "MiyousheSignInAssistant"
 PUBLISHER = "CN=MiyousheSignInAssistant"
 
-WINRT_WHEELS = ["winrt-Windows.UI.Notifications", "winrt-Windows.Data.Xml.Dom"]
+WINRT_WHEELS = ["winrt-Windows.UI.Notifications", "winrt-Windows.Data.Xml.Dom",
+                "winrt-Windows.Management.Deployment"]
+# 构建时/运行时都需要的命名空间（少一个助手就跑不起来）
+WINRT_NEEDED = ("winrt.windows.ui.notifications", "winrt.windows.data.xml.dom",
+                "winrt.windows.management.deployment")
 
 MANIFEST = """<?xml version="1.0" encoding="utf-8"?>
 <Package
@@ -112,8 +120,8 @@ def ensure_winrt() -> bool:
     解压进 site-packages。
     """
     try:
-        import winrt.windows.data.xml.dom  # noqa: F401
-        import winrt.windows.ui.notifications  # noqa: F401
+        for mod in WINRT_NEEDED:
+            __import__(mod)
         return True
     except Exception:
         pass
@@ -154,10 +162,22 @@ def ensure_winrt() -> bool:
                     open(dst, "wb") as f:
                 f.write(r.read())
         with zipfile.ZipFile(dst) as z:
-            z.extractall(site_dir)
+            # 已存在的文件不覆盖：这些 .pyd 常被安全软件锁住，覆盖会报
+            # PermissionError（而且同名文件内容本来就一样）
+            for info in z.infolist():
+                target = Path(site_dir) / info.filename
+                if info.is_dir():
+                    Path(site_dir, info.filename).mkdir(parents=True, exist_ok=True)
+                    continue
+                if target.exists():
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with z.open(info) as src, open(target, "wb") as out:
+                    shutil.copyfileobj(src, out)
     print("   已安装 %d 个包到 %s" % (len(plan), site_dir))
     try:
-        import winrt.windows.ui.notifications  # noqa: F401
+        for mod in WINRT_NEEDED:
+            __import__(mod)
         return True
     except Exception as e:
         print("   装完仍无法导入：%s" % e)
@@ -180,61 +200,118 @@ def build_helper() -> bool:
     return True
 
 
+def slim_helper() -> bool:
+    """把助手里的 winrt 扩展模块裁剪到"真实用到的导入闭包"。
+
+    PyInstaller 会把 winrt 包里 78 个命名空间全收进来（约 28 MB），
+    实际上我们只用「通知 / 通知 XML / 应用部署」三块，闭包只有 17 个模块。
+    裁完立刻跑一次助手的 --selftest 验证，失败就把备份还原回来。
+    """
+    wr = LAYOUT_DIR / "_internal" / "winrt"
+    if not wr.exists():
+        return True
+    # 注册流程会**惰性**用到 foundation / deployment 里的类型：不实际 import+用一次，
+    # 它们就不会出现在 sys.modules 里，闭包就会漏掉（曾把 foundation 裁掉导致
+    # --register-self 报 "No module named 'winrt._winrt_windows_foundation'"）。
+    from winrt.windows.foundation import Uri  # noqa: F401
+    from winrt.windows.management.deployment import (DeploymentOptions,  # noqa: F401
+                                                     PackageManager)
+    Uri("file:///C:/windows/win.ini")
+    pm = PackageManager()
+    try:
+        pm.find_packages_by_name_publisher(PKG_NAME, PUBLISHER)
+    except PermissionError:
+        pass                        # 非提权时会被拒，不代表缺模块
+    for mod in WINRT_NEEDED:
+        __import__(mod)
+    names = {m for m in sys.modules if m.startswith("winrt")}
+    keep = {"_" + m.replace(".", "_") + ".cp314-win_amd64.pyd" for m in names}
+    keep |= {"_" + m.replace(".", "_") + ".pyd" for m in names}
+    keep |= {m.split(".")[0] + ".pyd" for m in names}
+    # 这些命名空间里还有不少"惰性加载"的类型（比如注册时构造 Uri 用到的
+    # foundation / foundation.collections），靠 import 闭包抓不全，所以成组保留
+    HINTS = ("foundation", "management", "notifications", "data_xml", "storage",
+             "applicationmodel", "system", "runtime")
+    for f in wr.iterdir():
+        if f.suffix == ".pyd" and any(h in f.name for h in HINTS):
+            keep.add(f.name)
+
+    before = sum(f.stat().st_size for f in wr.rglob("*") if f.is_file())
+    bak = LAYOUT_DIR / "_internal" / "winrt_full"
+    if bak.exists():
+        shutil.rmtree(bak, ignore_errors=True)
+    shutil.copytree(wr, bak)
+    removed = 0
+    for f in list(wr.iterdir()):
+        if f.is_file() and f.suffix == ".pyd" and f.name not in keep:
+            f.unlink()
+            removed += 1
+    after = sum(f.stat().st_size for f in wr.rglob("*") if f.is_file())
+    print("   裁剪 winrt：删掉 %d 个模块，%.1f MB → %.1f MB"
+          % (removed, before / 1048576, after / 1048576))
+
+    r = subprocess.run([str(HELPER_EXE), "--selftest"], capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", timeout=300)
+    out = ((r.stdout or "") + (r.stderr or "")).strip()
+    if "失败" in out or "FAIL" in out.upper():
+        print("   裁剪后自检不通过，已还原完整模块：")
+        print("   " + out.replace("\n", " ")[:200])
+        shutil.rmtree(wr, ignore_errors=True)
+        shutil.move(str(bak), str(wr))
+        return False
+    shutil.rmtree(bak, ignore_errors=True)
+    print("   裁剪后自检通过（%s）" % "；".join(out.splitlines()[:3]))
+    return True
+
+
 def write_layout(version: str) -> bool:
-    print("== 2/3 写清单与图标 ==")
-    PKG_DIR.mkdir(parents=True, exist_ok=True)
-    (PKG_DIR / "AppxManifest.xml").write_text(
+    print("== 2/3 写清单与图标（放进助手自己的目录，便于它自注册）==")
+    LAYOUT_DIR.mkdir(parents=True, exist_ok=True)
+    LAYOUT_MANIFEST.write_text(
         MANIFEST.format(name=PKG_NAME, publisher=PUBLISHER, version=version,
-                        alias=ALIAS, helper=HELPER_REL), encoding="utf-8")
+                        alias=ALIAS, helper="toast_helper.exe"), encoding="utf-8")
     icon = BASE / "icon.png"
     for logo in ("StoreLogo.png", "Square150x150Logo.png", "Square44x44Logo.png"):
         if icon.exists():
-            shutil.copyfile(icon, PKG_DIR / logo)
-    print("   清单版本 %s（图标取自 icon.png）" % version)
+            shutil.copyfile(icon, LAYOUT_DIR / logo)
+    print("   清单版本 %s（布局根 = %s）" % (version, HELPER_SUBDIR))
     return True
 
 
 def register() -> bool:
-    """注册/更新松散布局包。
+    """注册/更新松散布局包：让**助手自己**注册（WinRT PackageManager，不起 PowerShell）。
 
-    注意：不能从 Python 直接捕获 Add-AppxPackage 的输出——它往被重定向的
-    控制台写日志时会报 "Win32 internal error Access is denied"（读控制台
-    缓冲区失败），所以这里把动作写成 .ps1 交给 powershell -File 执行，
-    再通过查询 Get-AppxPackage 判断结果。
+    这样构建脚本和便携版走的是同一条路，也不用担心"python 拉起的 PowerShell"
+    被安全软件拦掉 / 误判成木马。
     """
     print("== 3/3 注册松散布局包（需要开发者模式）==")
-    BUILD_DIR.mkdir(parents=True, exist_ok=True)
-    ps1 = BUILD_DIR / "register.ps1"
-    ps1.write_text(
-        "$ErrorActionPreference = 'Continue'\n"
-        "Get-AppxPackage -Name %s | Remove-AppxPackage -ErrorAction SilentlyContinue\n"
-        "Add-AppxPackage -Register '%s'\n"
-        "if (Get-AppxPackage -Name %s) { 'MYS-OK' } else { 'MYS-FAIL' } | "
-        "Out-File -Encoding utf8 '%s'\n"
-        % (PKG_NAME, (PKG_DIR / "AppxManifest.xml"), PKG_NAME,
-           BUILD_DIR / "register.result"),
-        encoding="utf-8-sig")
-    subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-                    "-File", str(ps1)], capture_output=True, text=True,
-                   encoding="gbk", errors="replace")
-    name = installed()
-    if name:
-        print("   已注册：%s" % name)
-    else:
-        # 安全软件会拦掉"python 拉起的 PowerShell"，导致查询拿不到结果，
-        # 所以这里不据此判失败——真正的判据是下面通过别名跑一次身份校验。
-        print("   查询被拦或未生效，改用别名身份校验判断")
-    return True
+    if not HELPER_EXE.exists():
+        print("   助手 exe 不存在")
+        return False
+    r = subprocess.run([str(HELPER_EXE), "--register-self"], capture_output=True,
+                       text=True, encoding="utf-8", errors="replace", timeout=600)
+    out = ((r.stdout or "") + (r.stderr or "")).strip()
+    print("   " + out.replace("\n", " ")[:220])
+    if "MYS-REGISTER:ok" in out:
+        return True
+    if "need-admin" in out:
+        print("   需要管理员权限：请以管理员身份重跑本脚本（只需一次）")
+    return False
 
 
 def uninstall() -> int:
-    out = _powershell("Get-AppxPackage -Name %s | Remove-AppxPackage; 'done'" % PKG_NAME)
-    if alias_path().exists():
-        print("卸载命令输出：%s" % out[:200].replace("\n", " "))
-        print("若仍存在，可在「设置 → 应用 → 已安装的应用」里卸载“米游社签到助手”")
+    """卸载助手（同样让助手自己动手）。"""
+    if not HELPER_EXE.exists():
+        print("助手 exe 不存在，无法卸载；可到「设置 → 应用」里卸载“米游社签到助手”")
         return 1
-    print("已卸载（主程序会自动退回到自绘卡片提醒）")
-    return 0
+    r = subprocess.run([str(HELPER_EXE), "--unregister-self"], capture_output=True,
+                       text=True, encoding="utf-8", errors="replace", timeout=600)
+    out = ((r.stdout or "") + (r.stderr or "")).strip()
+    print("   " + out.replace("\n", " ")[:200])
+    ok = alias_path().exists() is False
+    print("已卸载（主程序会自动退回到托盘气泡 / 自绘卡片提醒）" if ok else
+          "仍存在，可到「设置 → 应用」里卸载“米游社签到助手”")
+    return 0 if ok else 1
 
 
 def verify() -> bool:
@@ -277,6 +354,8 @@ def main() -> int:
             return 1
         if not build_helper():
             return 1
+        if not slim_helper():
+            print("（裁剪失败，继续用完整模块，体积会大一些）")
     if not write_layout(args.version) or not register():
         return 1
     ok = verify()

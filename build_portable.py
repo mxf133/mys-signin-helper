@@ -58,6 +58,14 @@ USAGE_TXT = """米游社签到助手 · 便携版
   登录凭据大约一个月会失效，之后签到会提示"需要重新登录"。
   这时再点一次【登录】重新扫码即可，其他不用管。
 
+【签到失败会怎么提醒我】
+
+  右下角弹一条真正的 Windows 系统通知（带程序名和图标，会留在通知中心）。
+  第一次要点一下界面上的【测试通知】来启用它：会弹一次管理员权限（UAC），
+  点【是】即可 —— 程序会在你机器上注册一个极小的「通知助手」组件，
+  文件放在 %LOCALAPPDATA%\\MiyousheSignInAssistant，随时能卸载。
+  不想启用也没关系：失败时程序会自己画一张右下角提示卡片，同样能看到。
+
 【出问题了怎么办】
 
   双击「自检.bat」，它会生成一份「自检报告.txt」并自动打开，
@@ -151,6 +159,21 @@ def main() -> int:
     (out / "使用说明.txt").write_text(USAGE_TXT, encoding="utf-8")
     (out / "自检.bat").write_bytes(
         CHECK_BAT.format(exe=EXE_NAME).replace("\n", "\r\n").encode("utf-8"))
+
+    # 把"通知助手"一起带上：便携版靠它才能弹出真正的 Windows 系统通知
+    # （WinRT 通知要求进程有"程序包标识"，非打包进程做不到）。
+    # 助手在首次点【测试通知】时用管理员权限注册一次，之后系统通知就可用。
+    helper_src = HERE / ".toast_pkg" / "toast_helper"
+    helper_dst = out / "通知助手"
+    if (helper_src / "toast_helper.exe").exists():
+        if helper_dst.exists():
+            shutil.rmtree(helper_dst)
+        shutil.copytree(helper_src, helper_dst)
+        size = sum(f.stat().st_size for f in helper_dst.rglob("*") if f.is_file())
+        print("      已带上通知助手（%.1f MB）" % (size / 1e6))
+    else:
+        print("      ！没有找到 .toast_pkg\\toast_helper，便携版将无法启用系统通知"
+              "（先跑一次 build_toast_package.py）")
 
     total = sum(f.stat().st_size for f in out.rglob("*") if f.is_file())
     print("      目录 %s（%.1f MB）" % (out.name, total / 1e6))

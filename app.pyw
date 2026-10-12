@@ -22,7 +22,7 @@ from pathlib import Path
 BASE = Path(__file__).resolve().parent
 APP_TITLE = "米游社签到助手"
 APP_SUB = "原神 · 崩坏：星穹铁道 · 绝区零 · 米游社每日签到"
-VERSION = "3.0.0"
+VERSION = "3.0.1"
 
 # 4K 屏上 Windows 缩放常为 150%~200%。进程若未声明 DPI 感知，系统会把整个
 # 窗口当位图放大——字体边缘被插值糊掉，这是界面发虚的根因。
@@ -812,13 +812,22 @@ class App:
         self.run_bg(job, "自动签到已关闭")
 
     def do_notify_test(self):
-        """发一条测试提醒，让用户确认"签到失败提醒"能不能收到。"""
-        # 同样放后台线程：右下角浮层会跑 20 秒，不能卡住界面
-        threading.Thread(
-            target=lambda: core.notify("米游社签到助手 · 通知测试",
-                                       "能在右下角看到这条，就说明签到失败提醒可用。"),
-            daemon=True).start()
-        self.set_status("测试提醒已发送，请看屏幕右下角（20 秒后自动消失）", ACCENT)
+        """发一条测试提醒，确认"签到失败提醒"能收到。
+
+        如果还没启用系统通知（便携版常见：没跑过注册），这里会顺手启用一次——
+        会弹一个 UAC，日志里会写清楚要做什么，用户点【是】即可。
+        """
+        def job():
+            if not core.toast_registered():
+                res = core.setup_toast(self._log_cb)
+                if not res.get("ok"):
+                    self._log_cb("系统通知没启用成功，本次改用右下角提醒兜底")
+            ok = core.notify("米游社签到助手 · 通知测试",
+                             "能在右下角看到这条，就说明签到失败提醒可用。")
+            return {"ok": bool(ok),
+                    "message": ("测试提醒已发送，请看屏幕右下角"
+                                if ok else "提醒没能弹出，详见运行日志")}
+        self.run_bg(job, "通知测试完成")
 
     def open_log(self):
         try:
@@ -842,7 +851,7 @@ class App:
 
 # 便携版把图形界面与命令行合在同一个 exe 里：带这些参数时不建窗口，
 # 直接走命令行逻辑。Windows 计划任务就是用 `exe sign` 把签到调起来的。
-CLI_ACTIONS = ("login", "sign", "status", "task", "untask", "doctor")
+CLI_ACTIONS = ("login", "sign", "status", "task", "untask", "doctor", "notify-setup")
 
 
 def main():
