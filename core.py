@@ -1749,6 +1749,34 @@ def toast_registered() -> bool:
     return toast_alias().exists()
 
 
+def _installed_helper_version() -> str:
+    """读取"已注册副本"里清单的版本号（读不到返回空串）。"""
+    manifest = HELPER_RESULT_FILE.parent / "pkg" / "AppxManifest.xml"
+    try:
+        m = re.search(r'<Identity[^>]*Version="([^"]+)"',
+                      manifest.read_text(encoding="utf-8"))
+        return m.group(1) if m else ""
+    except OSError:
+        return ""
+
+
+def _bundled_helper_version() -> str:
+    """读取"随程序分发"的助手清单版本号。"""
+    helper = toast_helper_exe()
+    try:
+        m = re.search(r'<Identity[^>]*Version="([^"]+)"',
+                      (helper.parent / "AppxManifest.xml").read_text(encoding="utf-8"))
+        return m.group(1) if m else ""
+    except OSError:
+        return ""
+
+
+def toast_helper_outdated() -> bool:
+    """注册的助手是不是旧版本（分发的比已注册的新 → 需要一次升级注册）。"""
+    have, want = _installed_helper_version(), _bundled_helper_version()
+    return bool(have and want and have != want)
+
+
 def setup_toast(on_log=None) -> dict:
     """一键启用真正的系统通知：把随程序分发的通知助手注册成已安装应用。
 
@@ -1761,8 +1789,10 @@ def setup_toast(on_log=None) -> dict:
     卸载"米游社签到助手"。
     """
     emit = _emit_factory(on_log)
-    if toast_registered():
+    if toast_registered() and not toast_helper_outdated():
         return {"ok": True, "already": True, "message": "系统通知已经可用"}
+    if toast_registered():
+        emit("已装的系统通知组件版本较旧，顺手升级一次。")
     helper = toast_helper_exe()
     if not helper.exists():
         msg = ("这个版本里没有带通知助手，无法启用系统通知"
