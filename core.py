@@ -45,13 +45,41 @@ def _app_dir() -> Path:
 BASE = _app_dir()
 CRED_FILE = BASE / "cookie.enc"
 PROFILE_DIR = BASE / ".edge_profile"
+PW_TMP_DIR = BASE / ".pw_tmp"
 LOG_FILE = BASE / "signin.log"
 STATE_FILE = BASE / "state.json"
 SETTINGS_FILE = BASE / "settings.json"
 
 LOGIN_URL = "https://www.miyoushe.com/sr/"
 TASK_NAME = "MYS-DailySignIn"
+# 备用任务名：安全软件可能把某个名字记进黑名单（同名怎么都建不上），
+# 换个名字就能成功，所以注册失败时自动换个名字再试。
+ALT_TASK_NAMES = ("MiyousheSignInAssistant",)
 LEGACY_TASK_NAMES = ("HSR-DailySignIn",)
+
+# 米游社账号会话校验接口（米游社 web 账号 SDK 自己用的那两个）。
+# 必须分开看，因为米哈游把两套会话分得很清：
+#   ltoken 会话       —— 社区、角色查询这类接口认它；
+#   cookie_token 会话 —— 游戏签到（event/luna）这类接口认它。
+# 历史上这里只认"有 ltoken 就算登录成功"，于是旧会话的 cookie_token
+# 过期后，程序一直显示已登录、签到却始终返回 -100（请登录后重试）。
+VERIFY_COOKIE_TOKEN_URL = ("https://passport-api.miyoushe.com"
+                           "/account/ma-cn-session/web/verifyCookieToken")
+VERIFY_LTOKEN_URL = ("https://passport-api.miyoushe.com"
+                     "/account/ma-cn-session/web/verifyLtoken")
+
+# 设备指纹 cookie：重新登录时保留，免得每次都被当成"新设备"而频繁触发短信验证。
+DEVICE_COOKIE_NAMES = ("_MHYUUID", "DEVICEFP", "DEVICEFP_SEED_ID", "DEVICEFP_SEED_TIME")
+
+# 登录态 cookie：重新登录前必须先清掉。否则浏览器会直接复用旧会话，
+# 一两秒就"登录成功"——既拿不到新的 cookie_token（签到真正要用的凭据），
+# 也换不了账号。这正是"点登录秒成功、无法退出"的原因。
+SESSION_COOKIE_NAMES = (
+    "cookie_token", "cookie_token_v2", "ltoken", "ltoken_v2",
+    "stoken", "stoken_v2", "login_ticket", "login_uid",
+    "account_id", "account_id_v2", "account_mid_v2",
+    "ltuid", "ltuid_v2", "ltmid_v2",
+)
 
 DEFAULT_SETTINGS = {"task_time": "09:05", "selected_games": None}
 MAX_LOG_LINES = 400
@@ -253,11 +281,18 @@ def _dpapi(data: bytes, protect: bool) -> bytes:
     return res
 
 
-def save_cookies(cookies: dict):
+def save_cookies(cookies: dict, sign_ready=None):
+    """加密保存 cookie。
+
+    sign_ready：cookie_token 会话是否校验通过（True/False/None=没测出来）。
+    存下来是为了界面上能区分"登录了"和"登录了但签到凭据不完整"。
+    """
     raw = json.dumps(cookies, ensure_ascii=False).encode("utf-8")
     CRED_FILE.write_bytes(_dpapi(raw, True))
-    save_state(login_time=now_str(), cred_count=len(cookies), cred_ok=True)
-    write_log("凭据已加密保存到 %s" % CRED_FILE.name)
+    save_state(login_time=now_str(), cred_count=len(cookies), cred_ok=True,
+               cred_names=sorted(cookies), sign_ready=sign_ready)
+    write_log("凭据已加密保存到 %s（%d 项 cookie，签到凭据校验=%s）"
+              % (CRED_FILE.name, len(cookies), sign_ready))
 
 
 def load_cookies() -> dict:
@@ -269,16 +304,609 @@ def load_cookies() -> dict:
         raise RuntimeError("凭据解密失败（是否换了 Windows 用户？）：%s" % e)
 
 
-def clear_credentials():
+def clear_credentials(on_log=None) -> dict:
+    """清除本机凭据，并顺带退出浏览器里的米游社登录态。"""
+    emit = _emit_factory(on_log)
     try:
         CRED_FILE.unlink()
     except Exception:
         pass
-    save_state(cred_ok=False, accounts={})
+    save_state(cred_ok=False, sign_ready=None, accounts={},
+               cred_count=0, cred_names=[])
+    emit("已清除本机登录凭据")
+    logged_out = _clear_browser_session(on_log=on_log)
+    if logged_out:
+        emit("已退出浏览器中的米游社登录状态")
+    return {
+        "ok": True,
+        "message": "已退出登录：本机凭据已清除"
+                   + ("，浏览器里的米游社登录态也已退出" if logged_out else ""),
+    }
 
 
 def _has_login(cookies: dict) -> bool:
     return bool({"cookie_token_v2", "cookie_token", "ltoken_v2", "ltoken"} & set(cookies))
+
+
+def _filter_cookies(raw) -> dict:
+    """只留米哈游系域下的 cookie，同名以最后一个为准。"""
+    return {
+        c["name"]: c["value"]
+        for c in raw or []
+        if any(k in (c.get("domain") or "") for k in ("mihoyo", "miyoushe", "hoyolab"))
+    }
+
+
+# ---------------------------------------------------------------- 会话校验
+
+async def _verify_session_async(cookies: dict) -> dict:
+    """分别校验 cookie_token 会话和 ltoken 会话。
+
+    返回 {"cookie_token": bool|None, "ltoken": bool|None, "detail": str}，
+    None 表示无法判定（网络异常、接口变更等），不能当成"失效"处理。
+    """
+    import aiohttp
+    out = {"cookie_token": None, "ltoken": None, "detail": ""}
+    details = []
+    for key, url in (("cookie_token", VERIFY_COOKIE_TOKEN_URL),
+                     ("ltoken", VERIFY_LTOKEN_URL)):
+        try:
+            timeout = aiohttp.ClientTimeout(total=20)
+            async with aiohttp.ClientSession(timeout=timeout) as s:
+                async with s.post(url, cookies=cookies,
+                                  headers={"user-agent": "Mozilla/5.0"}) as r:
+                    data = await r.json(content_type=None)
+            rc = data.get("retcode")
+            out[key] = (rc == 0)
+            details.append("%s retcode=%s" % (key, rc))
+        except Exception as e:
+            details.append("%s 无法校验(%s)" % (key, type(e).__name__))
+    out["detail"] = "，".join(details)
+    return out
+
+
+def verify_session(cookies=None) -> dict:
+    """同步版会话校验；没凭据或异常时返回可判定的结构。"""
+    if cookies is None:
+        try:
+            cookies = load_cookies()
+        except RuntimeError:
+            return {"cookie_token": None, "ltoken": None, "detail": "没有保存的凭据"}
+    try:
+        return asyncio.run(_verify_session_async(cookies))
+    except Exception as e:
+        return {"cookie_token": None, "ltoken": None,
+                "detail": "%s: %s" % (type(e).__name__, e)}
+
+
+# ---------------------------------------------------------------- Windows 系统通知
+
+NOTIFY_APP_NAME = "米游社签到助手"
+
+
+# 通知助手：一个已安装的 MSIX 包（松散布局注册）+ 应用执行别名
+TOAST_ALIAS_NAME = "miyoushe-toast.exe"
+_TOAST_ALIAS_WARNED = False
+
+
+def toast_alias() -> Path:
+    la = os.environ.get("LOCALAPPDATA") or ""
+    return Path(la) / "Microsoft" / "WindowsApps" / TOAST_ALIAS_NAME
+
+
+def _notify_toast(title: str, message: str) -> bool:
+    """通过"通知助手"发真正的 Windows 系统通知。
+
+    为什么要绕这一下：WinRT 的 ToastNotificationManager 只允许有"程序包标识"
+    （已安装应用）的进程调用，纯源码跑的 Python 进程会报 0x80073D54。
+    所以随程序安装了一个极小的 MSIX 包（底下是 toast_helper.exe，由
+    build_toast_package.py 打包注册），并声明了应用执行别名；主程序调用这个
+    别名，助手就等于"以已安装应用身份"运行，于是能发真通知（右下角+通知中心）。
+    没装助手（或调用失败）时返回 False，由调用方退到托盘气泡/自绘卡片。
+
+    注意：这里**故意不先做 alias.exists() 判断**——"应用执行别名"是重解析点，
+    安全软件可能间歇性拒绝 stat，而 Path.exists() 会把异常吞成 False，导致明明
+    装了助手却被跳过。直接尝试运行更可靠，真找不到文件会抛 FileNotFoundError。
+    """
+    global _TOAST_ALIAS_WARNED
+    alias = str(toast_alias())
+    last = ""
+    for cmd in ([alias], [TOAST_ALIAS_NAME]):        # 绝对路径，再退化到 PATH 查找
+        try:
+            r = subprocess.run(cmd + ["--title", title, "--message", message],
+                               capture_output=True, text=True, encoding="utf-8",
+                               errors="replace", timeout=120,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            if r.returncode == 0:
+                return True
+            last = "返回 %s：%s" % (r.returncode, (r.stderr or "").strip()[:140])
+            break                                     # 能跑起来但报错，就不再换路径试
+        except FileNotFoundError:
+            last = "找不到 %s" % cmd[0]
+            continue
+        except Exception as e:
+            last = "%s: %s" % (type(e).__name__, e)
+            break
+    if not _TOAST_ALIAS_WARNED:
+        _TOAST_ALIAS_WARNED = True
+        write_log("通知助手不可用（%s），本次改用其他提醒方式" % last)
+    return False
+
+
+def notify(title: str, message: str, level: str = "warn") -> bool:
+    """右下角弹一条提醒（能让用户"下次开电脑就发现签到失败"）。
+
+    依次尝试三条路，哪条通用哪条：
+      ① 通知助手 → 真正的 Windows 通知（右下角弹出、进通知中心）——
+         需要先运行过 build_toast_package.py 安装助手；
+      ② Shell_NotifyIcon 托盘气泡（同样是系统通知，但会被 360 之类拦住）；
+      ③ 自绘右下角卡片（纯窗口绘制，几乎不会被拦，只作最后兜底）。
+    刻意**不调用 PowerShell**：360 会把本程序拉起的 powershell.exe 判成
+    Trojan.Generic 直接结束进程并弹"木马查杀"警报。
+
+    三条都不行就只写日志——**绝不弹模态窗口**，不因为通知失败打断用户。
+    """
+    if sys.platform != "win32":
+        return False
+    title = (title or NOTIFY_APP_NAME)[:60]
+    message = (message or "")[:230]
+    if _notify_toast(title, message):
+        return True
+    if _notify_balloon(title, message, level):
+        return True
+    if _notify_card(title, message, level):
+        write_log("系统通知被拦，已改用右下角通知卡片")
+        return True
+    write_log("右下角提醒没能弹出（系统通知与卡片都失败）")
+    return False
+
+
+def _ensure_dpi_aware():
+    """声明 DPI 感知，否则高缩放（125%/150%）下窗口会被系统整体拉伸，文字发虚。
+
+    桌面版主程序启动时已经声明过；但定时任务/命令行（cli.py）没声明，
+    它弹出的右下角卡片就会糊。这里补上，进程级与线程级都试。
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        u32 = ctypes.windll.user32
+        try:
+            u32.SetProcessDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+            u32.SetProcessDpiAwarenessContext.restype = ctypes.c_bool
+            u32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))   # PER_MONITOR_V2
+        except Exception:
+            pass
+        try:
+            u32.SetThreadDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+            u32.SetThreadDpiAwarenessContext.restype = ctypes.c_void_p
+            u32.SetThreadDpiAwarenessContext(ctypes.c_void_p(-4))
+        except Exception:
+            pass
+        try:
+            if not u32.GetDpiForSystem():
+                ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except Exception:
+            pass
+    except Exception:
+        pass
+    finally:
+        # tempfile 之外，很多库会缓存 DPI，这里不必额外处理
+        pass
+
+
+def _notify_card(title: str, message: str, level: str = "warn",
+                 timeout_sec: int = 15) -> bool:
+    """右下角自绘的"通知卡片"（外观照着 Windows 通知做的）。
+
+    为什么需要它：真正的 WinRT Toast 要求进程有"程序包标识"（MSIX 打包应用），
+    非打包的 Python 进程调用会一直报"该进程没有程序包标识符"；而
+    Shell_NotifyIcon（托盘气泡）在装了 360 的机器上会被拒绝。
+    于是这里用最基础的窗口/绘图 API 自己画一张：圆角、图标、标题+正文、
+    从右侧滑入、十几秒后自动消失、点击立即关闭、不抢焦点。
+    这些都是任何 GUI 程序都会做的事，不会被安全软件当成异常行为。
+    """
+    if sys.platform != "win32":
+        return False
+    _ensure_dpi_aware()
+    try:
+        import time
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        gdi32 = ctypes.windll.gdi32
+        kernel32 = ctypes.windll.kernel32
+
+        LRESULT = ctypes.c_ssize_t
+        user32.DefWindowProcW.restype = LRESULT
+        user32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT,
+                                          wintypes.WPARAM, wintypes.LPARAM]
+        user32.CreateWindowExW.restype = wintypes.HWND
+        user32.CreateWindowExW.argtypes = [
+            wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID]
+        user32.BeginPaint.restype = wintypes.HDC
+        user32.BeginPaint.argtypes = [wintypes.HWND, ctypes.c_void_p]
+        user32.DrawTextW.restype = ctypes.c_int
+        user32.DrawTextW.argtypes = [wintypes.HDC, wintypes.LPCWSTR, ctypes.c_int,
+                                     ctypes.c_void_p, wintypes.UINT]
+        user32.FillRect.restype = ctypes.c_int
+        user32.FillRect.argtypes = [wintypes.HDC, ctypes.c_void_p, wintypes.HBRUSH]
+        user32.LoadImageW.restype = wintypes.HANDLE
+        user32.LoadImageW.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR,
+                                      wintypes.UINT, ctypes.c_int, ctypes.c_int,
+                                      wintypes.UINT]
+        user32.DrawIconEx.restype = wintypes.BOOL
+        user32.DrawIconEx.argtypes = [wintypes.HDC, ctypes.c_int, ctypes.c_int,
+                                      wintypes.HICON, ctypes.c_int, ctypes.c_int,
+                                      wintypes.UINT, wintypes.HBRUSH, wintypes.UINT]
+        user32.SetWindowRgn.restype = ctypes.c_int
+        user32.SetWindowRgn.argtypes = [wintypes.HWND, wintypes.HANDLE, wintypes.BOOL]
+        user32.SetWindowPos.restype = wintypes.BOOL
+        user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int,
+                                        ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                        wintypes.UINT]
+        user32.SystemParametersInfoW.restype = wintypes.BOOL
+        user32.SystemParametersInfoW.argtypes = [wintypes.UINT, wintypes.UINT,
+                                                 ctypes.c_void_p, wintypes.UINT]
+        gdi32.CreateSolidBrush.restype = wintypes.HBRUSH
+        gdi32.CreateSolidBrush.argtypes = [wintypes.DWORD]
+        gdi32.CreateRoundRectRgn.restype = wintypes.HANDLE
+        gdi32.CreateRoundRectRgn.argtypes = [ctypes.c_int] * 6
+        gdi32.CreateFontW.restype = wintypes.HANDLE
+        gdi32.CreateFontW.argtypes = [ctypes.c_int] * 5 + [wintypes.DWORD] * 4 \
+            + [wintypes.DWORD] * 4 + [wintypes.LPCWSTR]
+        gdi32.SelectObject.restype = wintypes.HANDLE
+        gdi32.SelectObject.argtypes = [wintypes.HDC, wintypes.HANDLE]
+        gdi32.SetTextColor.restype = wintypes.DWORD
+        gdi32.SetTextColor.argtypes = [wintypes.HDC, wintypes.DWORD]
+        gdi32.SetBkMode.restype = ctypes.c_int
+        gdi32.SetBkMode.argtypes = [wintypes.HDC, ctypes.c_int]
+        # 其余会碰到指针/句柄的调用也必须声明，否则 64 位下会被截成 32 位而报
+        # "OverflowError: int too long to convert"（表现为卡片画成空白）
+        user32.EndPaint.restype = wintypes.BOOL
+        user32.EndPaint.argtypes = [wintypes.HWND, ctypes.c_void_p]
+        user32.GetClientRect.restype = wintypes.BOOL
+        user32.GetClientRect.argtypes = [wintypes.HWND, ctypes.c_void_p]
+        user32.DestroyWindow.restype = wintypes.BOOL
+        user32.DestroyWindow.argtypes = [wintypes.HWND]
+        user32.ShowWindow.restype = wintypes.BOOL
+        user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+        user32.UpdateWindow.restype = wintypes.BOOL
+        user32.UpdateWindow.argtypes = [wintypes.HWND]
+        user32.KillTimer.restype = wintypes.BOOL
+        user32.KillTimer.argtypes = [wintypes.HWND, wintypes.UINT]
+        user32.SetTimer.restype = wintypes.UINT
+        user32.SetTimer.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.UINT,
+                                    ctypes.c_void_p]
+        user32.LoadCursorW.restype = wintypes.HANDLE
+        user32.LoadCursorW.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR]
+        user32.PostQuitMessage.restype = None
+        user32.PostQuitMessage.argtypes = [ctypes.c_int]
+        user32.GetMessageW.restype = ctypes.c_int
+        user32.GetMessageW.argtypes = [ctypes.c_void_p, wintypes.HWND,
+                                       wintypes.UINT, wintypes.UINT]
+        user32.TranslateMessage.restype = wintypes.BOOL
+        user32.TranslateMessage.argtypes = [ctypes.c_void_p]
+        user32.DispatchMessageW.restype = LRESULT
+        user32.DispatchMessageW.argtypes = [ctypes.c_void_p]
+        gdi32.DeleteObject.restype = wintypes.BOOL
+        gdi32.DeleteObject.argtypes = [wintypes.HANDLE]
+        gdi32.CreateRoundRectRgn.restype = wintypes.HANDLE
+
+        class WNDCLASSEXW(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.UINT), ("style", wintypes.UINT),
+                ("lpfnWndProc", ctypes.c_void_p), ("cbClsExtra", ctypes.c_int),
+                ("cbWndExtra", ctypes.c_int), ("hInstance", wintypes.HINSTANCE),
+                ("hIcon", wintypes.HICON), ("hCursor", wintypes.HANDLE),
+                ("hbrBackground", wintypes.HBRUSH), ("lpszMenuName", wintypes.LPCWSTR),
+                ("lpszClassName", wintypes.LPCWSTR), ("hIconSm", wintypes.HICON)]
+
+        class PAINTSTRUCT(ctypes.Structure):
+            _fields_ = [("hdc", wintypes.HDC), ("fErase", wintypes.BOOL),
+                        ("rcPaint", wintypes.RECT), ("fRestore", wintypes.BOOL),
+                        ("fIncUpdate", wintypes.BOOL),
+                        ("rgbReserved", ctypes.c_byte * 32)]
+
+        WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT,
+                                     wintypes.WPARAM, wintypes.LPARAM)
+        # 颜色是 COLORREF(0x00BBGGRR)：错误红 #DC2626、警告橙 #D97706
+        state = {"title": title, "text": message,
+                 "accent": 0x002626DC if level == "error" else 0x000677D9,
+                 "icon": None, "font_t": None, "font_b": None}
+
+        def _draw(hwnd):
+            ps = PAINTSTRUCT()
+            hdc = user32.BeginPaint(hwnd, ctypes.byref(ps))
+            try:
+                rc = wintypes.RECT()
+                user32.GetClientRect(hwnd, ctypes.byref(rc))
+                # 底色 + 1px 边框 + 左侧色条
+                bg = gdi32.CreateSolidBrush(0x00FFFFFF)
+                user32.FillRect(hdc, ctypes.byref(rc), bg)
+                border = gdi32.CreateSolidBrush(0x00EAE5E2)     # #e2e5ea
+                for r in (wintypes.RECT(0, 0, rc.right, 1),
+                          wintypes.RECT(0, rc.bottom - 1, rc.right, rc.bottom),
+                          wintypes.RECT(0, 0, 1, rc.bottom),
+                          wintypes.RECT(rc.right - 1, 0, rc.right, rc.bottom)):
+                    user32.FillRect(hdc, ctypes.byref(r), border)
+                bar = wintypes.RECT(0, 0, 5, rc.bottom)
+                user32.FillRect(hdc, ctypes.byref(bar),
+                                gdi32.CreateSolidBrush(state["accent"]))
+                gdi32.SetBkMode(hdc, 1)                         # TRANSPARENT
+                if state["icon"]:
+                    user32.DrawIconEx(hdc, 18, 20, state["icon"], 32, 32, 0, None, 3)
+                gdi32.SetTextColor(hdc, 0x0029231f)
+                old = gdi32.SelectObject(hdc, state["font_t"])
+                # DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS|DT_NOPREFIX
+                user32.DrawTextW(hdc, state["title"], -1,
+                                 ctypes.byref(wintypes.RECT(62, 16, rc.right - 16, 42)),
+                                 0x00000020 | 0x00000004 | 0x00008000 | 0x00000800)
+                gdi32.SetTextColor(hdc, 0x00806B5f)
+                gdi32.SelectObject(hdc, state["font_b"])
+                # DT_WORDBREAK|DT_NOPREFIX：正文允许换行（多行时不能带 END_ELLIPSIS）
+                user32.DrawTextW(hdc, state["text"], -1,
+                                 ctypes.byref(wintypes.RECT(62, 44, rc.right - 16,
+                                                            rc.bottom - 10)),
+                                 0x00000010 | 0x00000800)
+                gdi32.SelectObject(hdc, old)
+                for h in (bg, border):
+                    gdi32.DeleteObject(h)
+            finally:
+                user32.EndPaint(hwnd, ctypes.byref(ps))
+
+        def _wndproc(hwnd, msg, wparam, lparam):
+            if msg == 0x000F:                                   # WM_PAINT
+                _draw(hwnd)
+                return 0
+            if msg == 0x0014:                                   # WM_ERASEBKGND
+                return 1
+            if msg == 0x0113:                                   # WM_TIMER
+                user32.DestroyWindow(hwnd)
+                return 0
+            if msg == 0x0202:                                   # WM_LBUTTONUP
+                user32.DestroyWindow(hwnd)
+                return 0
+            if msg == 0x0021:                                   # WM_MOUSEACTIVATE
+                return 3                                        # MA_NOACTIVATE
+            if msg == 0x0002:                                   # WM_DESTROY
+                user32.KillTimer(hwnd, 1)
+                user32.PostQuitMessage(0)
+                return 0
+            return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+        proc = WNDPROC(_wndproc)
+        hinst = kernel32.GetModuleHandleW(None)
+        cls = "MYSCard_%d" % os.getpid()
+        wc = WNDCLASSEXW()
+        wc.cbSize = ctypes.sizeof(WNDCLASSEXW)
+        wc.lpfnWndProc = ctypes.cast(proc, ctypes.c_void_p)
+        wc.hInstance = hinst
+        wc.lpszClassName = cls
+        wc.hCursor = user32.LoadCursorW(None, ctypes.c_wchar_p(32512))
+        if not user32.RegisterClassExW(ctypes.byref(wc)):
+            return False
+
+        dpi = 96
+        try:
+            dpi = int(user32.GetDpiForSystem()) or 96
+        except Exception:
+            pass
+        s = dpi / 96.0
+        w, h = int(400 * s), int(120 * s)
+        wa = wintypes.RECT()
+        user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(wa), 0)   # SPI_GETWORKAREA
+        x = wa.right - w - int(16 * s)
+        y = wa.bottom - h - int(16 * s)
+
+        face = "Microsoft YaHei UI"
+        state["font_t"] = gdi32.CreateFontW(-int(11 * s), 0, 0, 0, 700, 0, 0, 0, 1,
+                                            0, 0, 5, 0, face)
+        state["font_b"] = gdi32.CreateFontW(-int(9.5 * s), 0, 0, 0, 400, 0, 0, 0, 1,
+                                            0, 0, 5, 0, face)
+        icon_path = BASE / "icon.ico"
+        if icon_path.exists():
+            state["icon"] = user32.LoadImageW(None, str(icon_path), 1, 32, 32, 0x10)
+
+        hwnd = user32.CreateWindowExW(
+            0x00000008 | 0x00000080 | 0x08000000,      # TOPMOST | TOOLWINDOW | NOACTIVATE
+            cls, cls, 0x80000000,                      # WS_POPUP
+            wa.right, y, w, h, None, None, hinst, None)
+        if not hwnd:
+            return False
+        rgn = gdi32.CreateRoundRectRgn(0, 0, w + 1, h + 1, int(12 * s), int(12 * s))
+        user32.SetWindowRgn(hwnd, rgn, True)
+        user32.ShowWindow(hwnd, 4)                     # SW_SHOWNOACTIVATE
+        user32.SetTimer(hwnd, 1, max(5, int(timeout_sec)) * 1000, None)
+        # 从右侧滑入，做出"通知"的感觉
+        steps = max(1, int(14 * s))
+        for i in range(1, steps + 1):
+            user32.SetWindowPos(hwnd, None, wa.right - int(w * i / steps) - int(16 * s),
+                                y, 0, 0, 0x0001 | 0x0004 | 0x0010)  # NOSIZE|NOZORDER|NOACTIVATE
+            time.sleep(0.012)
+        user32.SetWindowPos(hwnd, None, x, y, 0, 0, 0x0001 | 0x0004 | 0x0010)
+        user32.UpdateWindow(hwnd)
+
+        msg = wintypes.MSG()
+        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            user32.TranslateMessage(ctypes.byref(msg))
+            user32.DispatchMessageW(ctypes.byref(msg))
+        return True
+    except Exception as e:
+        write_log("右下角通知卡片失败：%s: %s" % (type(e).__name__, e))
+        return False
+
+
+def _notify_balloon(title: str, message: str, level: str = "warn") -> bool:
+    """Shell_NotifyIcon 的任务栏气泡（Win10/11 显示成右下角系统通知）。
+
+    纯 ctypes 实现：不调外部程序、不写注册表。实测在装了 360 的机器上
+    会被拒绝（NIM_ADD 返回 ERROR_ACCESS_DENIED），所以它只是"首选"，
+    失败后由 _notify_card 兜底。
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        shell32 = ctypes.windll.shell32
+        kernel32 = ctypes.windll.kernel32
+
+        # 64 位下必须显式声明参数/返回类型，否则指针会被截成 32 位而报
+        # "OverflowError: int too long to convert"，通知就弹不出来。
+        LRESULT = ctypes.c_ssize_t
+        user32.DefWindowProcW.restype = LRESULT
+        user32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT,
+                                          wintypes.WPARAM, wintypes.LPARAM]
+        user32.CreateWindowExW.restype = wintypes.HWND
+        user32.CreateWindowExW.argtypes = [
+            wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID]
+        user32.LoadIconW.restype = wintypes.HICON
+        user32.LoadIconW.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR]
+        user32.DestroyWindow.argtypes = [wintypes.HWND]
+        user32.PeekMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND,
+                                        wintypes.UINT, wintypes.UINT, wintypes.UINT]
+        user32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
+        user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
+        shell32.Shell_NotifyIconW.restype = wintypes.BOOL
+        kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+
+        NIM_ADD, NIM_MODIFY, NIM_DELETE = 0, 1, 2
+        NIF_MESSAGE, NIF_ICON, NIF_TIP, NIF_INFO = 0x1, 0x2, 0x4, 0x10
+        NIIF_INFO, NIIF_WARNING, NIIF_ERROR = 0x1, 0x2, 0x3
+        WM_APP = 0x8000
+        WM_TRAY = WM_APP + 21
+        IDI_INFORMATION = 32516
+        PM_REMOVE = 0x1
+
+        class NOTIFYICONDATAW(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.DWORD),
+                ("hWnd", wintypes.HWND),
+                ("uID", wintypes.UINT),
+                ("uFlags", wintypes.UINT),
+                ("uCallbackMessage", wintypes.UINT),
+                ("hIcon", wintypes.HICON),
+                ("szTip", wintypes.WCHAR * 128),
+                ("dwState", wintypes.DWORD),
+                ("dwStateMask", wintypes.DWORD),
+                ("szInfo", wintypes.WCHAR * 256),
+                ("uVersion", wintypes.UINT),
+                ("szInfoTitle", wintypes.WCHAR * 64),
+                ("dwInfoFlags", wintypes.DWORD),
+                ("guidItem", ctypes.c_byte * 16),
+                ("hBalloonIcon", wintypes.HICON),
+            ]
+
+        WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT,
+                                     wintypes.WPARAM, wintypes.LPARAM)
+
+        class WNDCLASSEXW(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.UINT),
+                ("style", wintypes.UINT),
+                ("lpfnWndProc", WNDPROC),
+                ("cbClsExtra", ctypes.c_int),
+                ("cbWndExtra", ctypes.c_int),
+                ("hInstance", wintypes.HINSTANCE),
+                ("hIcon", wintypes.HICON),
+                ("hCursor", wintypes.HANDLE),
+                ("hbrBackground", wintypes.HBRUSH),
+                ("lpszMenuName", wintypes.LPCWSTR),
+                ("lpszClassName", wintypes.LPCWSTR),
+                ("hIconSm", wintypes.HICON),
+            ]
+
+        shell32.Shell_NotifyIconW.argtypes = [wintypes.DWORD,
+                                              ctypes.POINTER(NOTIFYICONDATAW)]
+
+        hinst = kernel32.GetModuleHandleW(None)
+        cls_name = "MYSNotifyWnd_%d" % os.getpid()
+
+        def _wndproc(hwnd, msg, wparam, lparam):
+            return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+        _proc_ref = WNDPROC(_wndproc)          # 必须留引用，否则回调会被回收
+        wc = WNDCLASSEXW()
+        wc.cbSize = ctypes.sizeof(WNDCLASSEXW)
+        wc.lpfnWndProc = _proc_ref
+        wc.hInstance = hinst
+        wc.lpszClassName = cls_name
+        if not user32.RegisterClassExW(ctypes.byref(wc)):
+            raise RuntimeError("RegisterClassEx 失败（错误码 %d）" % kernel32.GetLastError())
+
+        hwnd = user32.CreateWindowExW(0, cls_name, cls_name, 0, 0, 0, 0, 0,
+                                      None, None, hinst, None)
+        if not hwnd:
+            raise RuntimeError("CreateWindowEx 失败（错误码 %d）" % kernel32.GetLastError())
+
+        shown = False
+        nid = NOTIFYICONDATAW()
+        nid.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
+        nid.hWnd = hwnd
+        nid.uID = 1
+        nid.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE
+        nid.uCallbackMessage = WM_TRAY
+        nid.hIcon = user32.LoadIconW(None, ctypes.c_wchar_p(IDI_INFORMATION))
+        nid.szTip = title[:120]
+        try:
+            if shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(nid)):
+                nid.uFlags = NIF_INFO
+                nid.szInfoTitle = title[:62]
+                nid.szInfo = message[:250]
+                nid.dwInfoFlags = {"info": NIIF_INFO, "warn": NIIF_WARNING,
+                                   "error": NIIF_ERROR}.get(level, NIIF_WARNING)
+                shown = bool(shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(nid)))
+                # 气泡要显示几秒：期间得让它挂着并泵消息，用完再撤掉图标
+                import time as _t
+                msg = wintypes.MSG()
+                end = _t.time() + 7
+                while _t.time() < end:
+                    while user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, PM_REMOVE):
+                        user32.TranslateMessage(ctypes.byref(msg))
+                        user32.DispatchMessageW(ctypes.byref(msg))
+                    _t.sleep(0.1)
+                shell32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(nid))
+        finally:
+            user32.DestroyWindow(hwnd)
+
+        if not shown:
+            write_log("系统通知未能弹出（Shell_NotifyIcon 返回失败）")
+        return shown
+    except Exception as e:
+        write_log("弹系统通知失败：%s: %s" % (type(e).__name__, e))
+        return False
+
+
+# 需要用户处理的状态（要重新登录 / 签到失败）
+BAD_SIGN_STATUS = ("invalid_cookie", "not_logged_in", "failed", "error")
+
+
+def notify_sign_failure(result: dict, source: str = "自动签到") -> bool:
+    """把"签到没成功"这件事弹成 Windows 通知，让用户下次开机能立刻发现。"""
+    games = (result or {}).get("games") or {}
+    bad = [(g.get("name") or k, (g.get("message") or "").strip())
+           for k, g in games.items() if (g or {}).get("status") in BAD_SIGN_STATUS]
+    if not bad:
+        return False
+
+    need_login = any((games.get(k) or {}).get("status") in ("invalid_cookie", "not_logged_in")
+                     for k in games)
+    if need_login:
+        title = "米游社签到失败：" + "、".join(n for n, _ in bad) + " 需要重新登录"
+        body = ("登录凭据已失效，签到没完成。\n"
+                "请打开「米游社签到助手」，点【登录米游社】重新登录一次。")
+    else:
+        title = "米游社签到失败：" + "、".join(n for n, _ in bad)
+        body = "；".join(m for _, m in bad if m) or "请打开「米游社签到助手」查看日志。"
+    if source:
+        body = "%s\n（%s）" % (body, source)
+    return notify(title, body, level="error")
 
 
 # ---------------------------------------------------------------- 客户端
@@ -301,10 +929,108 @@ def _game_enum(genshin, key: str):
     return getattr(genshin.Game, GAME_BY_KEY[key]["enum"])
 
 
+# ---------------------------------------------------------------- Playwright 临时目录
+
+def _playwright_env():
+    """把 TMP/TEMP 指到程序目录下的 .pw_tmp，返回原始值以便还原。
+
+    Playwright 的驱动是 Node，它按 TMP/TEMP 找临时目录。某些环境（受管控的
+    沙箱、权限被改坏的系统 Temp）里 Node 在 %TEMP% 下建不了目录，Playwright
+    会直接报：
+        EPERM: operation not permitted, mkdtemp '...\\playwright-artifacts-XXXXXX'
+    连浏览器窗口都起不来，用户看到的就是"点登录没反应/卡住"。
+    指到程序自己可写的位置就能绕开，且不再依赖系统 Temp。
+    """
+    try:
+        PW_TMP_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return None
+    old = {}
+    for name in ("TMP", "TEMP", "TMPDIR"):
+        old[name] = os.environ.get(name)
+        os.environ[name] = str(PW_TMP_DIR)
+    return old
+
+
+def _restore_env(old):
+    if not old:
+        return
+    for name, val in old.items():
+        if val is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = val
+
+
+def _cleanup_pw_tmp():
+    """清掉自己临时目录里的残留（清不掉也无所谓）。"""
+    try:
+        import shutil
+        shutil.rmtree(PW_TMP_DIR, ignore_errors=True)
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------- 登录（Playwright 驱动本机 Edge）
 
+def _drop_session_cookies(ctx) -> int:
+    """清掉浏览器里米游社的登录态 cookie（保留设备指纹），返回清掉的项数。"""
+    try:
+        names = {c["name"] for c in (ctx.cookies() or [])
+                 if any(k in (c.get("domain") or "")
+                        for k in ("mihoyo", "miyoushe", "hoyolab"))}
+    except Exception:
+        return 0
+    hit = [n for n in names if n in SESSION_COOKIE_NAMES]
+    for name in hit:
+        try:
+            ctx.clear_cookies(name=name)
+        except Exception:
+            pass
+    return len(hit)
+
+
+def _clear_browser_session(on_log=None) -> bool:
+    """用无头 Edge 退出持久化配置里的米游社登录态（不弹窗口）。"""
+    emit = _emit_factory(on_log)
+    if not PROFILE_DIR.exists():
+        return False
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return False
+    env_backup = _playwright_env()
+    try:
+        with sync_playwright() as p:
+            ctx = p.chromium.launch_persistent_context(
+                user_data_dir=str(PROFILE_DIR), channel="msedge", headless=True,
+                args=["--disable-blink-features=AutomationControlled"])
+            try:
+                _drop_session_cookies(ctx)
+                return True
+            finally:
+                try:
+                    ctx.close()
+                except Exception:
+                    pass
+    except Exception as e:
+        emit("退出浏览器登录状态失败（不影响本机凭据）：%s: %s" % (type(e).__name__, e))
+        return False
+    finally:
+        _restore_env(env_backup)
+        _cleanup_pw_tmp()
+
+
 def login(on_log=None, timeout_sec: int = 600) -> dict:
-    """打开 Edge 让用户登录米游社，从浏览器引擎层读取 cookie 并加密保存。"""
+    """打开 Edge 让用户登录米游社，从浏览器引擎层读取 cookie 并加密保存。
+
+    每次登录前都会先清掉浏览器里的米游社登录态（保留设备指纹 cookie），因为：
+      1) 不清就会直接复用旧会话，一两秒就"秒登录"，用户既换不了账号，
+         也拿不到新的 cookie_token；
+      2) 旧会话里的 cookie_token 失效，正是"显示已登录、签到却一直失败"的根因。
+    拿到 cookie 后还会真的校验一次会话：只有 cookie_token 会话有效，才算
+    "能签到的登录"，避免再来一次假成功。
+    """
     emit = _emit_factory(on_log)
     res = {"ok": False, "status": "error", "message": "", "ts": now_str()}
 
@@ -320,6 +1046,7 @@ def login(on_log=None, timeout_sec: int = 600) -> dict:
 
     found = None
     closed = False
+    env_backup = _playwright_env()
     try:
         with sync_playwright() as p:
             ctx = p.chromium.launch_persistent_context(
@@ -329,12 +1056,24 @@ def login(on_log=None, timeout_sec: int = 600) -> dict:
                 args=["--disable-blink-features=AutomationControlled"],
             )
             try:
+                # 先关掉会话恢复出来的其它标签页：否则它们可能把旧登录态又写回来
+                try:
+                    for extra in ctx.pages[1:]:
+                        extra.close()
+                except Exception:
+                    pass
+                dropped = _drop_session_cookies(ctx)
+                if dropped:
+                    emit("已退出浏览器里旧的米游社登录状态（%d 项 cookie），"
+                         "请重新登录（这样可以换账号）" % dropped)
+
                 page = ctx.pages[0] if ctx.pages else ctx.new_page()
                 try:
                     page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
                 except Exception:
                     pass
 
+                import time as _t
                 waited = 0
                 while waited < timeout_sec:
                     # 先读 cookie：用户手动关掉窗口时，第一个抛异常的就是
@@ -346,13 +1085,14 @@ def login(on_log=None, timeout_sec: int = 600) -> dict:
                     except Exception:
                         closed = True
                         break
-                    cookies = {
-                        c["name"]: c["value"]
-                        for c in raw
-                        if any(k in c.get("domain", "")
-                               for k in ("mihoyo", "miyoushe", "hoyolab"))
-                    }
+                    cookies = _filter_cookies(raw)
                     if _has_login(cookies):
+                        # 等 Set-Cookie 全部落地，免得只抓到一半
+                        _t.sleep(2.5)
+                        try:
+                            cookies = _filter_cookies(ctx.cookies()) or cookies
+                        except Exception:
+                            pass
                         found = cookies
                         break
                     try:
@@ -362,7 +1102,6 @@ def login(on_log=None, timeout_sec: int = 600) -> dict:
                     except Exception:
                         closed = True
                         break
-                    import time as _t
                     _t.sleep(1)
                     waited += 1
             finally:
@@ -371,9 +1110,19 @@ def login(on_log=None, timeout_sec: int = 600) -> dict:
                 except Exception:
                     pass
     except Exception as e:
-        res["message"] = "启动浏览器失败：%s: %s" % (type(e).__name__, e)
-        emit(res["message"])
+        msg = "启动浏览器失败：%s: %s" % (type(e).__name__, e)
+        text = str(e)
+        if "mkdtemp" in text or "EPERM" in text:
+            # 最常见的两种：系统临时目录不可写 / 浏览器被安全软件拦住
+            msg += ("\n（临时目录或权限问题：程序已改用自带的 %s 目录，"
+                    "若仍失败请检查 %%TEMP%% 权限、或重启电脑后再试）"
+                    % PW_TMP_DIR.name)
+        res["message"] = msg
+        emit(msg)
         return res
+    finally:
+        _restore_env(env_backup)
+        _cleanup_pw_tmp()
 
     if not found:
         if closed:
@@ -385,17 +1134,43 @@ def login(on_log=None, timeout_sec: int = 600) -> dict:
         emit(res["message"])
         return res
 
+    # 关键一步：校验会话，确认这次拿到的是"能签到"的凭据
+    check = verify_session(found)
+    res["session"] = check
+    emit("会话校验：%s" % check["detail"])
+
+    if check.get("ltoken") is False:
+        res["status"] = "invalid"
+        res["message"] = ("登录没有真正完成（米游社会话校验未通过：%s）。"
+                          "请重试，并在浏览器里改用「短信验证码 / 账号密码」方式登录。"
+                          % check["detail"])
+        emit(res["message"])
+        return res
+
+    sign_ready = check.get("cookie_token")
     try:
-        save_cookies(found)
+        save_cookies(found, sign_ready=sign_ready)
     except Exception as e:
         res["message"] = "保存凭据失败：%s" % e
         emit(res["message"])
         return res
 
-    emit("登录完成，已保存 %d 项 cookie" % len(found))
-    res["ok"] = True
-    res["status"] = "ok"
-    res["message"] = "登录成功，已保存 %d 项 cookie" % len(found)
+    res["ok"] = sign_ready is not False
+    if sign_ready is True:
+        res["status"] = "ok"
+        res["message"] = "登录成功，已保存 %d 项 cookie，签到凭据校验通过" % len(found)
+    elif sign_ready is False:
+        res["status"] = "partial"
+        res["message"] = ("已保存 %d 项 cookie，但米哈游没有给出可用的 cookie_token"
+                          "（%s），签到仍可能失败。建议再登录一次，"
+                          "或改用短信验证码 / 账号密码方式登录。"
+                          % (len(found), check["detail"]))
+    else:
+        res["status"] = "ok_unverified"
+        res["message"] = ("登录成功，已保存 %d 项 cookie；"
+                          "但本次无法校验签到凭据（%s）"
+                          % (len(found), check["detail"]))
+    emit(res["message"])
 
     accounts = fetch_accounts(on_log=on_log)
     if accounts:
@@ -520,9 +1295,13 @@ async def _sign_many_async(game_keys, force_info: bool, on_log) -> dict:
             except InvalidCookies:
                 res["status"] = "invalid_cookie"
                 res["ok"] = False
-                res["message"] = "cookie 已失效，请点「登录米游社」重新登录"
+                res["message"] = ("登录凭据已失效或不完整（游戏签到需要有效的 "
+                                  "cookie_token 会话），请点「登录米游社」重新登录")
                 emit("%s：%s" % (res["name"], res["message"]))
-                save_state(cred_ok=False)
+                # 只标记"签到凭据不可用"，不要顺手把 cred_ok 也置 False：
+                # 此时登录态可能仍然有效（能查到角色），右上角该显示
+                # "已登录 · 签到凭据不完整"这种可操作的状态，而不是"未登录"。
+                save_state(sign_ready=False)
             except Exception as e:
                 if res["status"] == "error":
                     res["message"] = "请求异常：%s: %s" % (type(e).__name__, e)
@@ -668,45 +1447,387 @@ _TASK_XML = """<?xml version="1.0" encoding="UTF-16"?>
 """
 
 
-def _query(name: str) -> bool:
+def _is_admin() -> bool:
+    """当前进程是否以管理员权限运行。"""
     try:
-        r = subprocess.run(["schtasks", "/Query", "/TN", name],
-                           capture_output=True, text=True,
-                           encoding="gbk", errors="replace")
-        return r.returncode == 0
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
     except Exception:
         return False
 
 
-def task_exists() -> bool:
-    return any(_query(n) for n in (TASK_NAME,) + LEGACY_TASK_NAMES)
+def _looks_missing(text: str, admin: bool = False) -> bool:
+    """schtasks 的报错是不是"任务不存在"。
+
+    坑一：中文系统下"任务不存在"的措辞不统一（找不到指定的任务/文件/路径）。
+    坑二：同一个命令在提权进程里报中文、普通权限下报英文（实测）。
+    坑三："找不到指定的路径"在普通权限下更可能是被安全软件拦了，不能当成"没有"。
+    """
+    t = (text or "").lower()
+    if "找不到指定的任务" in text or "找不到指定的文件" in text:
+        return True
+    if "cannot find the file" in t or "cannot find the task" in t:
+        return True
+    if "找不到指定的路径" in text or "cannot find the path" in t:
+        return bool(admin)
+    return False
 
 
-def task_detail() -> dict:
-    """返回 {exists, time, next_run}"""
-    out = {"exists": False, "time": None, "next_run": None}
-    target = None
-    for n in (TASK_NAME,) + LEGACY_TASK_NAMES:
-        if _query(n):
-            target = n
-            break
-    if not target:
-        return out
-    out["exists"] = True
+def _query_state(name: str) -> str:
+    """查询计划任务：'yes' 有 / 'no' 确实没有 / 'unknown' 查不了（被拦）。"""
     try:
-        r = subprocess.run(["schtasks", "/Query", "/TN", target, "/FO", "LIST", "/V"],
+        r = subprocess.run(["schtasks", "/Query", "/TN", name],
                            capture_output=True, text=True,
                            encoding="gbk", errors="replace")
-        text = (r.stdout or "") + (r.stderr or "")
-        m = re.search(r"(?:开始时间|Start Time):\s*(\d{2}:\d{2})", text)
-        if m:
-            out["time"] = m.group(1)
-        m2 = re.search(r"(?:下次运行时间|Next Run Time):\s*([^\r\n]+)", text)
-        if m2:
-            out["next_run"] = m2.group(1).strip()
+    except Exception:
+        return "unknown"
+    if r.returncode == 0:
+        return "yes"
+    text = ((r.stdout or "") + (r.stderr or "")).strip()
+    return "no" if _looks_missing(text, _is_admin()) else "unknown"
+
+
+def _query(name: str) -> bool:
+    """查询计划任务是否存在（区分不了"没有"和"查不了"时按没有处理）。"""
+    return _query_state(name) == "yes"
+
+
+# ---- 备用方案（不依赖计划任务、也绝不调用 PowerShell）--------------------
+#
+# 实测：360 安全卫士会把本程序拉起的 powershell.exe 判成 Trojan.Generic
+# 直接结束进程（并弹"木马查杀"警报）。所以程序不再调用 PowerShell，
+# 备用方案只用两种纯 Python 手段：
+#   ① 注册表启动项 HKCU\...\CurrentVersion\Run（winreg）
+#   ② 启动文件夹里放一个 .cmd（纯文件写入；登录后自动签到一次）
+# 二者与计划任务等效：都是"开机/登录后自动签到一次"。
+
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+RUN_VALUE_NAME = "MiyousheSignInAssistant"
+STARTUP_FILE_NAME = "米游社签到助手（开机签到）.cmd"
+# 早期版本用 PowerShell 建过 .lnk，保留识别与清理，免得用户关不掉
+STARTUP_LEGACY_NAMES = ("米游社签到助手（开机签到）.lnk",)
+
+
+def _startup_dir() -> Path:
+    appdata = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+    return (Path(appdata) / "Microsoft" / "Windows" / "Start Menu"
+            / "Programs" / "Startup")
+
+
+def _startup_file() -> Path:
+    return _startup_dir() / STARTUP_FILE_NAME
+
+
+def _startup_files() -> list:
+    return [_startup_dir() / n for n in (STARTUP_FILE_NAME,) + STARTUP_LEGACY_NAMES]
+
+
+def _startup_enabled() -> bool:
+    try:
+        return any(f.exists() for f in _startup_files())
+    except Exception:
+        return False
+
+
+def _run_key_command() -> str:
+    exe, args = task_action()
+    return '"%s" %s' % (exe, args)
+
+
+def _run_key_enabled() -> bool:
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
+            winreg.QueryValueEx(k, RUN_VALUE_NAME)
+        return True
+    except Exception:
+        return False
+
+
+def _create_run_key() -> tuple:
+    try:
+        import winreg
+        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, RUN_KEY, 0,
+                                winreg.KEY_SET_VALUE) as k:
+            winreg.SetValueEx(k, RUN_VALUE_NAME, 0, winreg.REG_SZ, _run_key_command())
+        return True, ""
+    except Exception as e:
+        return False, "%s: %s" % (type(e).__name__, e)
+
+
+def _create_startup_file() -> tuple:
+    """最后的后路：启动文件夹里放一个 .cmd（纯文件写入，不起任何外部程序）。"""
+    try:
+        _startup_dir().mkdir(parents=True, exist_ok=True)
+        exe, args = task_action()
+        _startup_file().write_text(
+            '@echo off\r\nrem 米游社签到助手：登录 Windows 后自动签到一次\r\n'
+            'start "" /min "%s" %s\r\n' % (exe, args), encoding="gbk")
+        return _startup_file().exists(), ""
+    except Exception as e:
+        return False, "%s: %s" % (type(e).__name__, e)
+
+
+def _remove_extra_autostart(emit=None) -> bool:
+    """清掉注册表启动项与启动文件夹里的备用项，返回是否清掉了东西。"""
+    removed = False
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0,
+                            winreg.KEY_SET_VALUE) as k:
+            winreg.DeleteValue(k, RUN_VALUE_NAME)
+            removed = True
     except Exception:
         pass
+    try:
+        for f in _startup_files():
+            if f.exists():
+                f.unlink()
+                removed = True
+    except Exception:
+        pass
+    if removed and emit:
+        emit("已移除开机启动项")
+    return removed
+
+
+# 查询计划任务要起进程，界面每次刷新都查会很卡，所以缓存一小会儿
+_TASK_CACHE = {"at": 0.0, "data": None}
+
+
+def task_exists() -> bool:
+    return task_detail().get("exists", False)
+
+
+def task_detail(use_cache: bool = True) -> dict:
+    """返回 {exists, time, next_run, mode}
+
+    mode: "task" = 系统计划任务；"runkey"/"startup" = 备用开机启动方式。
+    """
+    import time as _t
+    if use_cache and _TASK_CACHE["data"] is not None \
+            and _t.time() - _TASK_CACHE["at"] < 20:
+        return dict(_TASK_CACHE["data"])
+
+    out = {"exists": False, "time": None, "next_run": None, "mode": None}
+    target = None
+    target = ""
+    unqueryable = False
+    for n in (TASK_NAME,) + ALT_TASK_NAMES + LEGACY_TASK_NAMES:
+        state = _query_state(n)
+        if state == "yes":
+            target = n
+            break
+        if state == "unknown":
+            unqueryable = True
+
+    if not target and unqueryable and load_settings().get("autostart") == "task":
+        # 管理员建好的任务，普通权限的本程序常常"查不到"（安全软件连 schtasks
+        # 查询一起拦）。此时以设置里记录的 autostart=task 为准，避免状态显示错、
+        # 或者每次开机都重新注册一遍。
+        target = TASK_NAME
+
+    if target:
+        out["exists"] = True
+        out["mode"] = "task"
+        try:
+            r = subprocess.run(["schtasks", "/Query", "/TN", target, "/FO", "LIST", "/V"],
+                               capture_output=True, text=True,
+                               encoding="gbk", errors="replace")
+            text = (r.stdout or "") + (r.stderr or "")
+            m = re.search(r"(?:开始时间|Start Time):\s*(\d{2}:\d{2})", text)
+            if m:
+                out["time"] = m.group(1)
+            m2 = re.search(r"(?:下次运行时间|Next Run Time):\s*([^\r\n]+)", text)
+            if m2:
+                out["next_run"] = m2.group(1).strip()
+        except Exception:
+            pass
+    elif _run_key_enabled():
+        out.update(exists=True, mode="runkey",
+                   time=load_settings().get("task_time") or "09:05")
+    elif _startup_enabled():
+        out.update(exists=True, mode="startup",
+                   time=load_settings().get("task_time") or "09:05")
+
+    _TASK_CACHE.update(at=_t.time(), data=dict(out))
     return out
+
+
+def _create_task_via_schtasks(xml_path: str, task_name: str = TASK_NAME) -> tuple:
+    """用系统自带的 schtasks 注册计划任务（不调用 PowerShell）。"""
+    try:
+        r = subprocess.run(
+            ["schtasks", "/Create", "/TN", task_name, "/XML", xml_path, "/F"],
+            capture_output=True, text=True, encoding="gbk", errors="replace")
+    except Exception as e:
+        return False, "无法调用 schtasks：%s: %s" % (type(e).__name__, e)
+    if r.returncode != 0:
+        return False, ((r.stdout or "") + (r.stderr or "")).strip()
+    # 复核：schtasks 返回 0 也要确认任务真的在（避免假成功）
+    return _query(task_name), "任务已创建但查询不到"
+
+
+def run_elevated(parameters: str, timeout_sec: int = 180) -> tuple:
+    """用管理员权限运行本程序的 CLI（会弹一次 UAC），并等它结束。
+
+    为什么需要：实测在装了 360 之类安全软件的机器上，**普通权限**运行的本程序
+    （以及它拉起的任何子进程，包括打包好的 exe）做"注册表启动项 / 启动文件夹 /
+    计划任务"这类系统写入时会被无声拒绝——同一个任务 XML 由 PowerShell 执行却
+    立刻成功，说明这是按"未知/未签名程序"下发的策略。以管理员身份运行同样的
+    命令则全部成功，所以这里用 ShellExecuteExW("runas") 请求一次提权，由用户
+    在 UAC 窗口确认。
+    返回 (是否成功, 说明)；用户点了"否"时说明里会带 ERROR_CANCELLED。
+    """
+    if sys.platform != "win32":
+        return False, "仅支持 Windows"
+    exe = _pythonw_exe() or sys.executable
+    cli = BASE / "cli.py"
+    try:
+        from ctypes import wintypes
+
+        shell32 = ctypes.windll.shell32
+        kernel32 = ctypes.windll.kernel32
+
+        class SHELLEXECUTEINFOW(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.DWORD), ("fMask", ctypes.c_ulong),
+                        ("hwnd", wintypes.HWND), ("lpVerb", wintypes.LPCWSTR),
+                        ("lpFile", wintypes.LPCWSTR), ("lpParameters", wintypes.LPCWSTR),
+                        ("lpDirectory", wintypes.LPCWSTR), ("nShow", ctypes.c_int),
+                        ("hInstApp", wintypes.HINSTANCE), ("lpIDList", ctypes.c_void_p),
+                        ("lpClass", wintypes.LPCWSTR), ("hkeyClass", wintypes.HKEY),
+                        ("dwHotKey", wintypes.DWORD), ("hIcon", wintypes.HANDLE),
+                        ("hProcess", wintypes.HANDLE)]
+
+        shell32.ShellExecuteExW.restype = wintypes.BOOL
+        shell32.ShellExecuteExW.argtypes = [ctypes.c_void_p]
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+        info = SHELLEXECUTEINFOW()
+        info.cbSize = ctypes.sizeof(SHELLEXECUTEINFOW)
+        info.fMask = 0x00000040                      # SEE_MASK_NOCLOSEPROCESS
+        info.lpVerb = "runas"
+        info.lpFile = str(exe)
+        info.lpParameters = '"%s" %s' % (cli, parameters)
+        info.lpDirectory = str(BASE)
+        info.nShow = 1                               # SW_SHOWNORMAL
+        if not shell32.ShellExecuteExW(ctypes.byref(info)):
+            err = ctypes.get_last_error()
+            return False, ("提权被取消（错误 %d）" % err if err == 1223
+                           else "无法提权（错误 %d）" % err)
+        kernel32.WaitForSingleObject(info.hProcess, max(10, timeout_sec) * 1000)
+        kernel32.CloseHandle(info.hProcess)
+        return True, "提权命令已执行完"
+    except Exception as e:
+        return False, "提权失败：%s: %s" % (type(e).__name__, e)
+
+
+def create_task_elevated(time_str: str = "09:05", on_log=None) -> dict:
+    """用管理员权限注册计划任务（UAC 一次），成功后按子进程写的结论更新状态。"""
+    emit = _emit_factory(on_log)
+    emit("普通权限被系统拒绝，正在请求管理员权限——"
+         "请在弹出的 UAC 窗口点「是」（只此一次）。")
+    try:
+        TASK_RESULT_FILE.unlink()
+    except OSError:
+        pass
+    ok, detail = run_elevated('task --time %s' % time_str)
+    _TASK_CACHE["at"] = 0.0
+    if not ok:
+        emit(detail)
+        return {"ok": False, "message": detail}
+    res = read_task_result()
+    if res.get("ok"):
+        msg = res.get("message") or "已用管理员权限开启每日自动签到"
+        save_settings(task_time=time_str, autostart="task")
+        emit(msg)
+        return {"ok": True, "message": msg, "mode": res.get("mode") or "task"}
+    emit(res.get("message") or "提权命令执行完了，但没有成功注册（详见运行日志）")
+    return {"ok": False, "message": res.get("message") or "提权后仍未注册成功"}
+
+
+def delete_task_elevated(on_log=None) -> dict:
+    """用管理员权限删除计划任务（UAC 一次）。"""
+    emit = _emit_factory(on_log)
+    emit("需要管理员权限才能删除计划任务，请在弹出的 UAC 窗口点「是」（只此一次）。")
+    try:
+        TASK_RESULT_FILE.unlink()
+    except OSError:
+        pass
+    ok, detail = run_elevated("untask")
+    _TASK_CACHE["at"] = 0.0
+    if not ok:
+        emit(detail)
+        return {"ok": False, "message": detail}
+    res = read_task_result()
+    if res.get("ok") or not task_detail(use_cache=False).get("exists"):
+        msg = res.get("message") or "已关闭每日自动签到"
+        emit(msg)
+        return {"ok": True, "message": msg}
+    emit(res.get("message") or "提权后仍未能关闭，详见运行日志")
+    return {"ok": False, "message": res.get("message") or "提权后仍未能关闭"}
+
+
+TASK_RESULT_FILE = BASE / ".task_result.json"
+
+
+def write_task_result(res: dict):
+    """把计划任务注册/删除的结果落盘。
+
+    提权运行的 CLI 是被 ShellExecuteExW 拉起的独立进程，父进程拿不到它的返回值；
+    而普通权限的父进程又常常"查不到"管理员创建的任务（安全软件连 schtasks 查询
+    都拦），所以让子进程把结论写在这个文件里，父进程读完即知成败。
+    """
+    try:
+        TASK_RESULT_FILE.write_text(json.dumps(res, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def read_task_result() -> dict:
+    try:
+        data = json.loads(TASK_RESULT_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _create_task_via_helper(time_str: str) -> tuple:
+    """让"打包助手"（已安装的 MSIX 应用）替我们注册开机自启。
+
+    有些机器只拦 python 进程（普通权限下写启动项/计划任务被拒），却放行已安装的
+    打包应用；助手就是干这个用的，成功时返回 (True, 模式名)。
+    """
+    pythonw = _pythonw_exe()
+    if not pythonw:
+        return False, "找不到 pythonw.exe"
+    cli = BASE / "cli.py"
+    args = ["--autostart-create", time_str, "--pythonw", pythonw, "--script", str(cli)]
+    for cmd in ([str(toast_alias())], [TOAST_ALIAS_NAME]):
+        try:
+            r = subprocess.run(cmd + args, capture_output=True, text=True,
+                               encoding="utf-8", errors="replace", timeout=120,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except FileNotFoundError:
+            continue
+        except Exception as e:
+            return False, "%s: %s" % (type(e).__name__, e)
+        for line in (r.stdout or "").splitlines():
+            if line.startswith("MYS-AUTOSTART:"):
+                mode = line.split(":", 1)[1].strip()
+                return (mode not in ("", "failed")), (mode or "failed")
+        return False, ((r.stderr or "").strip()[:120] or "助手没有返回结果")
+    return False, "找不到通知助手"
+
+
+def _pythonw_exe() -> str:
+    for name in ("pythonw.exe", "python.exe"):
+        p = BASE / ".venv" / "Scripts" / name
+        if p.exists():
+            return str(p)
+    return ""
 
 
 def create_task(time_str: str = "09:05", on_log=None) -> dict:
@@ -728,71 +1849,139 @@ def create_task(time_str: str = "09:05", on_log=None) -> dict:
                 pass
 
     cmd, args = task_action()
-    xml_text = _TASK_XML % {
-        "start": datetime.now().strftime("%Y-%m-%d") + "T" + time_str + ":00",
-        "command": _xml_escape(cmd),
-        "arguments": _xml_escape(args),
-        "user": "%s\\%s" % (os.environ.get("USERDOMAIN", ""),
-                            os.environ.get("USERNAME", "")),
-    }
+    created_name = None
+    last_detail = ""
 
-    import tempfile
-    fd, xml_path = tempfile.mkstemp(suffix=".xml", prefix="mys-task-")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-16") as f:
-            f.write(xml_text)
+    # 任务名也要留后路：实测安全软件会把某个名字"记住"并永久拒绝创建
+    # （同样的 XML 换个名字就能建成功），所以主名字失败就换备用名字再试。
+    for task_name in (TASK_NAME,) + ALT_TASK_NAMES:
+        xml_text = _TASK_XML % {
+            "start": datetime.now().strftime("%Y-%m-%d") + "T" + time_str + ":00",
+            "command": _xml_escape(cmd),
+            "arguments": _xml_escape(args),
+            "user": "%s\\%s" % (os.environ.get("USERDOMAIN", ""),
+                                os.environ.get("USERNAME", "")),
+        }
+        import tempfile
+        fd, xml_path = tempfile.mkstemp(suffix=".xml", prefix="mys-task-")
         try:
-            r = subprocess.run(
-                ["schtasks", "/Create", "/TN", TASK_NAME, "/XML", xml_path, "/F"],
-                capture_output=True, text=True, encoding="gbk", errors="replace")
+            with os.fdopen(fd, "w", encoding="utf-16") as f:
+                f.write(xml_text)
+            ok, detail = _create_task_via_schtasks(xml_path, task_name)
+            if ok:
+                created_name = task_name
+            else:
+                last_detail = detail
+                emit("注册计划任务「%s」没成功" % task_name)
         except Exception as e:
-            msg = ("无法调用系统计划任务命令 schtasks（%s: %s）。"
-                   "可能是安全软件或系统策略限制了该命令，"
-                   "可以改用「任务计划程序」手动创建，指向 %s"
-                   % (type(e).__name__, e, task_command()))
-            emit(msg)
-            return {"ok": False, "message": msg}
-    finally:
-        try:
-            os.remove(xml_path)
-        except OSError:
-            pass
+            last_detail = "%s: %s" % (type(e).__name__, e)
+        finally:
+            try:
+                os.remove(xml_path)
+            except OSError:
+                pass
+        if created_name:
+            break
 
-    if r.returncode == 0:
-        save_settings(task_time=time_str)
+    if created_name:
+        _TASK_CACHE["at"] = 0.0
+        save_settings(task_time=time_str, autostart="task")
         msg = "已开启每日自动签到：每天 %s 后台签到 %s" % (
-            time_str, "、".join(g["name"] for g in GAMES))
+            time_str, "、".join(game_name(k) for k in selected_games()))
         emit(msg)
-        return {"ok": True, "message": msg}
-    detail = ((r.stdout or "") + (r.stderr or "")).strip()
-    msg = "注册计划任务失败：%s" % (detail or "权限不足，可尝试以管理员身份运行")
+        return {"ok": True, "message": msg, "mode": "task", "task_name": created_name}
+
+    # 第二条路：交给"打包助手"（已安装应用）试一次——有些机器只拦 python，
+    # 却放行已安装的打包应用，这样就不用麻烦用户点 UAC。
+    if not created_name:
+        ok_h, mode_h = _create_task_via_helper(time_str)
+        if ok_h:
+            _TASK_CACHE["at"] = 0.0
+            save_settings(task_time=time_str, autostart=mode_h or "task")
+            msg = ("已开启每日自动签到：每天 %s 后台签到 %s（由通知助手注册）"
+                   % (time_str, "、".join(game_name(k) for k in selected_games())))
+            emit(msg)
+            return {"ok": True, "message": msg, "mode": mode_h or "task"}
+        last_detail = last_detail or ("助手方式：%s" % mode_h)
+
+    # 第三条路：普通权限的纯 Python 手段（注册表启动项 → 启动文件夹）
+    for label, maker, mode in (("注册表启动项", _create_run_key, "runkey"),
+                               ("启动文件夹", _create_startup_file, "startup")):
+        try:
+            ok, detail = maker()
+        except Exception as e:
+            ok, detail = False, "%s: %s" % (type(e).__name__, e)
+        if ok:
+            _TASK_CACHE["at"] = 0.0
+            save_settings(task_time=time_str, autostart=mode)
+            msg = ("系统计划任务被安全软件拦住了，已改用【%s】方式："
+                   "每次登录 Windows 后自动签到一次（当天没签的会自动补签）。"
+                   % label)
+            emit(msg)
+            return {"ok": True, "message": msg, "mode": mode}
+        last_detail = last_detail or detail
+
+    msg = ("普通权限下无法注册开机自动签到：系统计划任务、注册表启动项、"
+           "启动文件夹三条路都被拒绝了。\n"
+           "这通常是安全软件对「未知/未签名程序」下发的策略"
+           "——实测同一个任务 XML 交给 PowerShell 执行却能成功。\n"
+           "程序接下来会请求一次管理员权限（UAC）再试：在弹窗里点「是」即可。")
+    if last_detail:
+        msg += "\n（技术细节：%s）" % last_detail.replace("\n", " ")[:150]
     emit(msg)
-    return {"ok": False, "message": msg}
+    return {"ok": False, "message": msg,
+            # 状态栏只显示这一句，完整说明在运行日志里
+            "status_text": "普通权限被拒，正在请求管理员权限…"}
 
 
 def delete_task(on_log=None) -> dict:
+    """关闭每日自动签到（普通权限）。删不动计划任务时返回 ok=False，
+    让界面用管理员权限再试一次。"""
     emit = _emit_factory(on_log)
-    ok, extra = False, []
-    for n in (TASK_NAME,) + LEGACY_TASK_NAMES:
-        if not _query(n):
-            continue
+    removed, blocked, extra = False, False, []
+    for n in (TASK_NAME,) + ALT_TASK_NAMES + LEGACY_TASK_NAMES:
+        legacy = n in LEGACY_TASK_NAMES
+        state = _query_state(n)
+        if state == "no":
+            continue                                  # 本来就没有
+        if state == "unknown":
+            # 查不了时：当前名字按"设置里记着是任务模式"处理；历史名字无法确认，
+            # 不动它——删一个不存在的任务会报错，容易被误判成"被安全软件拦了"
+            if legacy or load_settings().get("autostart") != "task":
+                continue
         try:
             r = subprocess.run(["schtasks", "/Delete", "/TN", n, "/F"],
                                capture_output=True, text=True,
                                encoding="gbk", errors="replace")
         except Exception as e:
-            extra.append("无法调用 schtasks（%s: %s）" % (type(e).__name__, e))
-            break
+            if not legacy:
+                extra.append("无法调用 schtasks（%s: %s）" % (type(e).__name__, e))
+                blocked = True
+            continue
         if r.returncode == 0:
-            ok = True
-        else:
-            extra.append("删除 %s 失败：%s"
-                         % (n, ((r.stdout or "") + (r.stderr or "")).strip()))
-    msg = "已关闭每日自动签到" if ok else "当前没有已注册的自动签到任务"
-    emit(msg)
+            removed = True
+            continue
+        text = ((r.stdout or "") + (r.stderr or "")).strip()
+        if _looks_missing(text, _is_admin()):
+            continue                                  # 任务不存在，不算失败
+        if not legacy:
+            extra.append("删除 %s 失败：%s" % (n, text[:120]))
+            blocked = True
+    # 备用方案（注册表启动项 / 启动文件夹）也要一起关掉
+    if _remove_extra_autostart(emit):
+        removed = True
+    _TASK_CACHE["at"] = 0.0
     for m in extra:
         emit(m)
-    return {"ok": len(extra) == 0, "message": msg}
+    if blocked:
+        msg = "普通权限删不掉计划任务（被系统拒绝），接下来会请求管理员权限再试"
+        emit(msg)
+        return {"ok": False, "message": msg}
+    if removed:
+        save_settings(autostart="")
+    msg = "已关闭每日自动签到" if removed else "当前没有已注册的自动签到任务"
+    emit(msg)
+    return {"ok": True, "message": msg}
 
 
 # ---------------------------------------------------------------- 汇总状态（界面首屏用）
@@ -825,6 +2014,9 @@ def local_state() -> dict:
 
     return {
         "cred_ok": bool(cred_flag) and CRED_FILE.exists(),
+        # sign_ready：凭据是否通过 cookie_token 会话校验（True/False/None=未知）。
+        # 用它在界面上区分"登录了"和"登录了但签到凭据不完整"。
+        "sign_ready": st.get("sign_ready"),
         "login_time": st.get("login_time"),
         "task_time": settings.get("task_time", "09:05"),
         "selected": sel,

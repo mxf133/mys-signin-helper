@@ -120,8 +120,13 @@ def _check_playwright():
 
     import tempfile
     import shutil
-    tmp = tempfile.mkdtemp(prefix="mys_pw_")
+    # 和登录一样，先把 TMP/TEMP 指到程序自带的临时目录：
+    # Node（Playwright 驱动）在 %TEMP% 建不了目录时会直接 EPERM，
+    # 不这样处理自检会误报"无头 Edge 启动失败"。
+    env_backup = core._playwright_env()
+    tmp = None
     try:
+        tmp = tempfile.mkdtemp(prefix="doctor_", dir=str(core.PW_TMP_DIR))
         with sync_playwright() as p:
             ctx = p.chromium.launch_persistent_context(
                 user_data_dir=tmp, channel="msedge", headless=True,
@@ -131,7 +136,9 @@ def _check_playwright():
     except Exception as e:
         return False, "启动无头 Edge 失败：%r" % (e,)
     finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+        if tmp:
+            shutil.rmtree(tmp, ignore_errors=True)
+        core._restore_env(env_backup)
 
 
 def doctor():
@@ -225,6 +232,10 @@ def main():
                          "不传或传 all 表示按界面里勾选的游戏")
     ap.add_argument("--show", action="store_true",
                     help="仅用于 doctor：自检完自动打开报告文件")
+    ap.add_argument("--notify", action="store_true",
+                    help="仅用于 doctor：自检完再弹一条系统通知，用来确认通知功能可用")
+    ap.add_argument("--time", default=None,
+                    help="仅用于 task：自动签到时间 HH:MM（默认用设置里的值）")
     args = ap.parse_args()
 
     if not args.game or "all" in args.game:
@@ -242,20 +253,32 @@ def main():
     elif args.action == "sign":
         res = core.sign_once(keys, False)
         core.write_log("结果：" + core.summarize(res))
+        # 定时任务在后台跑（没有窗口），失败必须弹 Windows 系统通知，
+        # 否则用户开机后根本不知道今天没签上、或者 cookie 已经过期。
+        if res.get("ok") is not True:
+            core.notify_sign_failure(res, source="每日自动签到")
         sys.exit(0 if res.get("ok") else 1)
     elif args.action == "status":
         res = core.sign_once(keys, True)
         sys.exit(0 if res.get("ok") else 1)
     elif args.action == "task":
-        res = core.create_task(core.load_settings().get("task_time", "09:05"))
+        res = core.create_task(args.time or core.load_settings().get("task_time", "09:05"))
+        # 提权运行时（父进程拿不到返回值）把结论落盘给父进程读
+        core.write_task_result(res)
         sys.exit(0 if res.get("ok") else 1)
     elif args.action == "untask":
         res = core.delete_task()
+        core.write_task_result(res)
         sys.exit(0 if res.get("ok") else 1)
     elif args.action == "doctor":
         report = doctor()
         if args.show:
             open_report(report)
+        if args.notify:
+            print("\n正在发送测试通知……")
+            ok = core.notify("米游社签到助手 · 通知测试",
+                             "能在右下角看到这条，就说明签到失败提醒可用。")
+            print("通知测试：%s" % ("已发送" if ok else "没能弹出（详见日志/自检报告）"))
         sys.exit(0)
 
 

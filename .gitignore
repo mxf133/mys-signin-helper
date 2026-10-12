@@ -9,6 +9,10 @@ cookie.enc
 .edge_profile/
 .edge_profile*
 
+# Playwright / Node 用的临时目录（程序自带，绕开系统 %TEMP% 权限问题）
+.pw_tmp/
+.pw_tmp*
+
 # 运行日志与状态（含 UID、昵称、签到记录）
 signin.log
 state.json
@@ -16,6 +20,9 @@ settings.json
 
 # doctor 生成的自检报告（含本机路径、日志片段）
 自检报告.txt
+
+# 提权注册计划任务时，子进程写给父进程看的结果文件
+.task_result.json
 
 # ============================================================
 #  运行环境
@@ -37,6 +44,14 @@ dist_portable/
 build/
 dist/
 *.spec
+
+# ============================================================
+#  通知助手（MSIX 包）的构建产物
+#  build_toast_package.py 会生成 .toast_pkg/（注册到系统的松散布局包）
+#  与 .toast_build/（PyInstaller 中间文件、WinRT wheel 缓存），都不入库
+# ============================================================
+.toast_pkg/
+.toast_build/
 
 # ============================================================
 #  编辑器与系统

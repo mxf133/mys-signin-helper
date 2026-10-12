@@ -14,6 +14,7 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
@@ -21,7 +22,7 @@ from pathlib import Path
 BASE = Path(__file__).resolve().parent
 APP_TITLE = "米游社签到助手"
 APP_SUB = "原神 · 崩坏：星穹铁道 · 绝区零 · 米游社每日签到"
-VERSION = "2.2.2"
+VERSION = "3.0.0"
 
 # 4K 屏上 Windows 缩放常为 150%~200%。进程若未声明 DPI 感知，系统会把整个
 # 窗口当位图放大——字体边缘被插值糊掉，这是界面发虚的根因。
@@ -328,6 +329,12 @@ class App:
         self.busy = False
         self.buttons = []
         self.cards = {}
+        # 上次弹"签到失败"系统通知的时间（节流用，不重复打扰）
+        self._notified_fail_at = 0.0
+        # 用户接受"重新登录"后，登录成功就自动补签一次
+        self._sign_after_login = False
+        # 当前后台操作的超时时刻（看门狗用，防止界面卡在"执行中…"）
+        self._op_deadline = None
 
         self._build()
         self._load_local()
@@ -438,6 +445,7 @@ class App:
                  anchor="w").pack(side="left")
         Btn(lh, "打开日志文件", self.open_log, kind="ghost").pack(side="right")
         Btn(lh, "清空", self.clear_log, kind="ghost").pack(side="right", padx=px(4))
+        Btn(lh, "测试通知", self.do_notify_test, kind="ghost").pack(side="right", padx=px(4))
 
         wrap = tk.Frame(logf, bg=LOG_BG, highlightbackground=BORDER,
                         highlightthickness=px(1))
@@ -508,35 +516,75 @@ class App:
             self.set_status(text, ACCENT)
 
     # ------------------------------------------------------------ 线程与消息泵
-    def run_bg(self, fn, done_status=None):
+    def run_bg(self, fn, done_status=None, is_login=False):
         if self.busy:
             return
+        # 看门狗：万一线程意外没了（没回结果），也不能让界面永久卡在"执行中…"
+        timeout = 720 if is_login else 300
+        self._op_deadline = time.monotonic() + timeout
         self.set_busy(True, "执行中…")
-        self._spawn(fn, done_status)
+        self._spawn(fn, done_status, is_login=is_login)
 
-    def _spawn(self, fn, done_status):
+    def _spawn(self, fn, done_status, silent=False, is_login=False):
         def worker():
             try:
                 res = fn()
-            except Exception as e:
+            except BaseException as e:  # noqa: BLE001 - 任何异常都必须变回结果，否则界面卡死
                 res = {"ok": False, "message": "%s: %s" % (type(e).__name__, e)}
-            self.q.put(("done", res, done_status))
+            try:
+                self.q.put(("done", res, done_status, silent, is_login))
+            except BaseException:  # noqa: BLE001
+                pass
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _handle_item(self, item):
+        if item[0] == "log":
+            self.append_log(item[1])
+            return
+        if item[0] != "done":
+            return
+        res = item[1] if len(item) > 1 else None
+        done_status = item[2] if len(item) > 2 else None
+        silent = item[3] if len(item) > 3 else False
+        is_login = item[4] if len(item) > 4 else False
+        self._op_deadline = None
+        self.set_busy(False)
+        self._after_run(res, done_status, silent=silent, is_login=is_login)
 
     def _pump(self):
         try:
             while True:
                 item = self.q.get_nowait()
-                if item[0] == "log":
-                    self.append_log(item[1])
-                elif item[0] == "done":
-                    _, res, done_status = item
+                try:
+                    self._handle_item(item)
+                except Exception as e:
+                    # 处理单条消息出错绝不能把消息泵弄死：
+                    # 泵一死，按钮就永远停用、状态栏永远"执行中…"，看起来就是卡死。
+                    self._op_deadline = None
                     self.set_busy(False)
-                    self._after_run(res, done_status)
+                    note = "界面处理结果时出错：%s: %s" % (type(e).__name__, e)
+                    self.append_log("[界面] " + note)
+                    core.write_log("[界面] " + note)
         except queue.Empty:
             pass
-        self.root.after(120, self._pump)
+        except Exception as e:
+            core.write_log("[界面] 消息循环异常：%s: %s" % (type(e).__name__, e))
+        # 看门狗：操作超时（线程没回结果）就恢复界面，别一直"执行中…"
+        try:
+            if self.busy and self._op_deadline and time.monotonic() > self._op_deadline:
+                self._op_deadline = None
+                self.set_busy(False)
+                msg = "操作超时（后台线程没有返回结果），已恢复按钮，可重试"
+                self.append_log("[界面] " + msg)
+                core.write_log("[界面] " + msg)
+                self.set_status(msg, BAD)
+        except Exception:
+            pass
+        try:
+            self.root.after(120, self._pump)
+        except Exception:
+            pass
 
     def _log_cb(self, msg):
         self.q.put(("log", "[%s] %s" % (datetime.now().strftime("%H:%M:%S"), msg)))
@@ -559,51 +607,119 @@ class App:
 
         login_time = st.get("login_time")
         if st.get("cred_ok"):
-            self.account.configure(
-                text="已登录" + ("　上次登录 %s" % login_time if login_time else ""),
-                fg=OK)
+            if st.get("sign_ready") is False:
+                # 登录态在、但缺 cookie_token：签到会一直 -100，必须明说
+                self.account.configure(
+                    text="已登录 · 签到凭据不完整，请点「登录米游社」", fg=WARN)
+            else:
+                self.account.configure(
+                    text="已登录" + ("　上次登录 %s" % login_time if login_time else ""),
+                    fg=OK)
         else:
             self.account.configure(text="未登录", fg=BAD)
 
         td = core.task_detail()
         if td["exists"]:
             t = td.get("time") or st.get("task_time") or "09:05"
-            if td.get("time"):
+            if td.get("time") and td.get("mode") == "task":
                 self.time_var.set(td["time"])
-            self.task_hint.configure(text="每日自动签到：已开启 · 每天 %s" % t, fg=OK)
+            if td.get("mode") == "startup":
+                # 计划任务被安全软件拦了，走的是启动文件夹方案
+                self.task_hint.configure(
+                    text="每日自动签到：已开启（开机启动 · 约 %s）" % t, fg=OK)
+            else:
+                self.task_hint.configure(text="每日自动签到：已开启 · 每天 %s" % t, fg=OK)
         else:
             self.task_hint.configure(text="每日自动签到：未开启", fg=SUBTEXT)
 
     def refresh(self, silent=False):
         def job():
-            res = core.sign_once(force_info=True, on_log=self._log_cb)
+            # 开机/打开程序时，只要当天还有游戏没签就直接签掉；
+            # 都签过了就只查状态，避免多余的接口调用。
+            st = core.load_state()
+            games = st.get("games") or {}
+            pending = [k for k in core.selected_games()
+                       if (games.get(k) or {}).get("signed_today") is not True]
+            res = core.sign_once(force_info=not pending, on_log=self._log_cb)
             # 首次运行顺手补一次角色信息，失败不影响主流程
             if not core.load_state().get("accounts"):
                 core.fetch_accounts(self._log_cb)
             return res
         if silent:
-            self._spawn(job, None)
+            self._spawn(job, None, silent=True)
         else:
             self.run_bg(job, "状态已刷新")
 
-    def _after_run(self, res, done_status):
+    def _notify_failure(self, res):
+        """签到没成时在右下角提醒（先试系统通知，被拦就自绘浮层），并准备好"下一步"。
+
+        注意：提醒要走后台线程。右下角浮层会自己跑 20 秒消息循环，
+        如果放在界面主线程里调用，整个窗口会卡住 20 秒。
+        这里也刻意不再用程序内弹窗：重新登录的入口就在界面上
+        （右上角提示 + 【登录米游社】按钮），不必打断用户。
+        """
+        now = time.monotonic()
+        if now - self._notified_fail_at < 600:      # 10 分钟内不重复提醒
+            return
+        self._notified_fail_at = now
+        # 用户看到提醒后自然会点【登录米游社】，登录成功就自动补签一次
+        self._sign_after_login = True
+        threading.Thread(
+            target=lambda: core.notify_sign_failure(res, source="米游社签到助手"),
+            daemon=True).start()
+
+    def _after_run(self, res, done_status, silent=False, is_login=False):
         self._render()
         res = res or {}
+
+        # 用户是为了修签到才重新登录的：登录成功就顺手补签一次，闭环
+        if is_login:
+            if res.get("ok") and self._sign_after_login:
+                self._sign_after_login = False
+                self.set_status("登录成功，正在自动补签一次…", ACCENT)
+                self.do_sign_all()
+                return
+            self.set_status(self._brief(res, "登录流程结束"),
+                            OK if res.get("ok") else BAD)
+            return
+
         games = res.get("games") or {}
         bad = any((g or {}).get("status") in ("invalid_cookie", "failed", "error",
                                               "not_logged_in")
                   for g in games.values())
         if res.get("ok") and not bad:
-            self.set_status(done_status or res.get("message") or "完成", OK)
+            self.set_status(self._brief(res, done_status or "完成"), OK)
         elif res.get("ok"):
             # 部分成功（例如原神签上了、崩铁失败）：用黄字把两边的实际情况都摆出来
             self.set_status(core.summarize(res) or done_status or "部分完成", WARN)
         elif games:
-            self.set_status(res.get("message") or core.summarize(res) or "操作失败", BAD)
+            self.set_status(core.summarize(res) or self._brief(res, "操作失败"), BAD)
         else:
             # 登录 / 计划任务这类没有 games 字段的操作：一律以 ok 判定，
             # 之前只认 games，导致登录失败也显示灰色，很容易被当成没事。
-            self.set_status(res.get("message") or done_status or "操作失败", BAD)
+            self.set_status(self._brief(res, done_status or "操作失败"), BAD)
+
+        # 有游戏没签成 → 弹系统通知，让用户（尤其是不在电脑前时）也能发现。
+        # 静默刷新时也弹，但同样受 10 分钟节流保护，不会刷屏。
+        if bad:
+            self._notify_failure(res)
+
+    @staticmethod
+    def _brief(res, fallback=""):
+        """状态栏只放一句话。
+
+        像"开启自动签到失败"这种提示是多行的、几百字，直接塞进状态栏会糊在
+        窗口底部（截图里就是这样）。完整的说明已经写进运行日志了，状态栏
+        只留第一行并截断即可。
+        """
+        text = (res or {}).get("status_text") or (res or {}).get("message") or ""
+        # 注意：空串的 splitlines() 是空列表，直接取 [0] 会 IndexError
+        # （"开启自动签到失败"这类多行提示一旦没有 message 就会踩到）
+        lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+        text = lines[0] if lines else ""
+        if len(text) > 44:
+            text = text[:43] + "…"
+        return text or fallback
 
     # ------------------------------------------------------------ 具体动作
     def do_sign_all(self):
@@ -648,32 +764,61 @@ class App:
         self.run_bg(lambda: core.sign_once([key], False, self._log_cb),
                     "%s 签到完成" % name)
 
-    def do_login(self):
-        if core.local_state().get("cred_ok"):
+    def do_login(self, skip_confirm=False):
+        if core.local_state().get("cred_ok") and not skip_confirm:
             from tkinter import messagebox
             if not messagebox.askyesno(
                     "重新登录",
-                    "已有保存的登录凭据，重新登录会覆盖它。\n\n继续吗？"):
+                    "已有保存的登录凭据。\n\n"
+                    "登录时程序会先退出浏览器里旧的米游社登录状态"
+                    "（保留设备信息），再请你重新登录。\n"
+                    "这样才能换账号，也才能拿到可用于签到的新凭据。\n\n继续吗？"):
                 return
-        self.run_bg(lambda: core.login(self._log_cb), "登录流程结束")
+        self.run_bg(lambda: core.login(self._log_cb), "登录流程结束", is_login=True)
 
     def do_clear(self):
         from tkinter import messagebox
-        if not messagebox.askyesno("清除凭据",
-                                   "将删除本机保存的登录凭据，之后需要重新登录。\n\n继续吗？"):
+        if not messagebox.askyesno(
+                "清除凭据 / 退出登录",
+                "将删除本机保存的登录凭据，并退出程序中浏览器里的米游社"
+                "登录状态（之后需要重新登录，可换成别的账号）。\n\n继续吗？"):
             return
-        core.clear_credentials()
-        core.write_log("已清除本机登录凭据")
-        self.append_log("[%s] 已清除本机登录凭据" % datetime.now().strftime("%H:%M:%S"))
-        self._render()
-        self.set_status("凭据已清除", WARN)
+        self.run_bg(lambda: core.clear_credentials(self._log_cb), "已退出登录")
 
     def do_task_on(self):
+        """开启 / 更新每日自动签到。
+
+        先按普通权限试一次；被系统（安全软件按"未知程序"下发的策略）拒绝时，
+        自动请求一次管理员权限再注册——实测提权后计划任务、注册表启动项、
+        启动文件夹三条路都能成功，所以用户只需在 UAC 窗口点一次「是」。
+        """
         t = (self.time_var.get() or "").strip()
-        self.run_bg(lambda: core.create_task(t, self._log_cb), "自动签到已开启")
+
+        def job():
+            res = core.create_task(t, self._log_cb)
+            if res.get("ok"):
+                return res
+            return core.create_task_elevated(t, self._log_cb)
+
+        self.run_bg(job, "自动签到已开启")
 
     def do_task_off(self):
-        self.run_bg(lambda: core.delete_task(self._log_cb), "自动签到已关闭")
+        def job():
+            res = core.delete_task(self._log_cb)
+            if res.get("ok"):
+                return res
+            return core.delete_task_elevated(self._log_cb)
+
+        self.run_bg(job, "自动签到已关闭")
+
+    def do_notify_test(self):
+        """发一条测试提醒，让用户确认"签到失败提醒"能不能收到。"""
+        # 同样放后台线程：右下角浮层会跑 20 秒，不能卡住界面
+        threading.Thread(
+            target=lambda: core.notify("米游社签到助手 · 通知测试",
+                                       "能在右下角看到这条，就说明签到失败提醒可用。"),
+            daemon=True).start()
+        self.set_status("测试提醒已发送，请看屏幕右下角（20 秒后自动消失）", ACCENT)
 
     def open_log(self):
         try:
