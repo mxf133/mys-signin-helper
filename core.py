@@ -81,7 +81,8 @@ SESSION_COOKIE_NAMES = (
     "ltuid", "ltuid_v2", "ltmid_v2",
 )
 
-DEFAULT_SETTINGS = {"task_time": "09:05", "selected_games": None}
+DEFAULT_SETTINGS = {"task_time": "09:05", "selected_games": None,
+                    "notify_on_success": True}
 MAX_LOG_LINES = 400
 
 # 支持的游戏：key 内部标识，enum 对应 genshin.Game 成员名，
@@ -889,12 +890,24 @@ BAD_SIGN_STATUS = ("invalid_cookie", "not_logged_in", "failed", "error")
 SIGN_DONE_STATUS = ("claimed", "already") + BAD_SIGN_STATUS
 
 
-def notify_sign_result(result: dict, source: str = "") -> bool:
+def notify_on_success() -> bool:
+    """用户是否希望在"签到成功"后也收到通知（默认开，可在界面里关掉）。
+
+    关掉后只在失败 / 需要重新登录时提醒——适合不想被"每天签到成功"
+    这类消息打扰的用户。签到失败的通知不受此设置影响，永远会发。
+    """
+    return bool(load_settings().get("notify_on_success", True))
+
+
+def notify_sign_result(result: dict, source: str = "", force: bool = False) -> bool:
     """每次签到结束后都弹一条 Windows 通知——成功、已签过、失败都算。
 
     手动签到、开机自动签到、计划任务签到都会走到这里，用户随时知道
     "今天签上了 / 早就签过了 / 哪个游戏失败了"。纯状态查询（force_info，
     没有真的发起签到）不发通知，免得每次刷新状态都打扰用户。
+
+    force=True 时无视 notify_on_success 设置（【通知样例】按钮的预览用：
+    用户把成功通知关掉后，仍然可以主动看看它长什么样）。
     """
     games = (result or {}).get("games") or {}
     if not games:
@@ -934,6 +947,8 @@ def notify_sign_result(result: dict, source: str = "") -> bool:
             body = "；".join(ok_lines + [m for _, m in bad if m]) \
                 or "请打开「米游社签到助手」查看运行日志。"
     else:
+        if not force and not notify_on_success():
+            return False                  # 用户选择了"成功后不打扰"
         title = "米游社签到完成"
         body = "；".join(ok_lines) or "今天已经没有需要签到的游戏了。"
     if source:
@@ -2162,6 +2177,7 @@ def local_state() -> dict:
         "sign_ready": st.get("sign_ready"),
         "login_time": st.get("login_time"),
         "task_time": settings.get("task_time", "09:05"),
+        "notify_on_success": notify_on_success(),
         "selected": sel,
         "game_list": detail,
     }

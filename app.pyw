@@ -22,7 +22,7 @@ from pathlib import Path
 BASE = Path(__file__).resolve().parent
 APP_TITLE = "米游社签到助手"
 APP_SUB = "原神 · 崩坏：星穹铁道 · 绝区零 · 米游社每日签到"
-VERSION = "3.1.1"
+VERSION = "3.1.2"
 
 # 4K 屏上 Windows 缩放常为 150%~200%。进程若未声明 DPI 感知，系统会把整个
 # 窗口当位图放大——字体边缘被插值糊掉，这是界面发虚的根因。
@@ -415,7 +415,7 @@ class App:
             self.buttons.append(b)
 
         row2 = tk.Frame(ops, bg=CARD)
-        row2.pack(fill="x", padx=px(18), pady=(px(10), px(16)))
+        row2.pack(fill="x", padx=px(18), pady=(px(10), 0))
         tk.Label(row2, text="每天自动签到时间", bg=CARD, fg=SUBTEXT,
                  font=F_SMALL).pack(side="left", padx=(0, px(8)))
         self.time_var = tk.StringVar(value="09:05")
@@ -431,6 +431,19 @@ class App:
             self.buttons.append(b)
         self.task_hint = tk.Label(row2, text="", bg=CARD, fg=SUBTEXT, font=F_SMALL)
         self.task_hint.pack(side="right")
+
+        # ---- 签到成功后的通知开关（有人只想在失败时被提醒）
+        row3 = tk.Frame(ops, bg=CARD)
+        row3.pack(fill="x", padx=px(18), pady=(px(10), px(16)))
+        self.notify_ok = tk.BooleanVar(value=True)
+        tk.Checkbutton(
+            row3, text="签到成功后也弹通知", variable=self.notify_ok,
+            command=self.on_notify_toggle, bg=CARD, fg=SUBTEXT, font=F_SMALL,
+            activebackground=CARD, activeforeground=TEXT, selectcolor=CARD,
+            bd=0, highlightthickness=0, cursor="hand2", anchor="w").pack(side="left")
+        tk.Label(row3, text="取消勾选后，只在签到失败 / 需要重新登录时提醒",
+                 bg=CARD, fg=HINT, font=F_SMALL).pack(side="left",
+                                                      padx=(px(10), 0))
 
         # ---- 日志区
         logf = tk.Frame(r, bg=CARD, highlightbackground=BORDER,
@@ -602,6 +615,7 @@ class App:
     def _load_local(self):
         st = core.local_state()
         self.time_var.set(st.get("task_time") or "09:05")
+        self.notify_ok.set(bool(st.get("notify_on_success", True)))
         self._render(st)
         tail = core.read_log_tail(80)
         self.append_log(tail if tail else "（暂无日志）")
@@ -748,6 +762,12 @@ class App:
         self.run_bg(lambda: core.sign_once(None, False, self._log_cb), label,
                     notify_source=source)
 
+    def on_notify_toggle(self):
+        """签到成功后的通知开关：立刻落盘，下次签到（含计划任务）即生效。"""
+        on = bool(self.notify_ok.get())
+        core.save_settings(notify_on_success=on)
+        self.set_status("签到成功后%s弹通知" % ("会" if on else "不再"), SUBTEXT)
+
     def on_game_toggled(self, key, flag):
         """勾选框变动：立刻落盘 + 刷新卡片样式（下次签到/定时任务都用这个选择）。"""
         card = self.cards.get(key)
@@ -873,12 +893,14 @@ class App:
     def do_notify_sample(self, status: str):
         """弹一条签到结果的通知样例（成功 / 失败），看看签完提醒长什么样。
 
-        用的是假数据，不会真的去签到；系统通知没启用时会先尝试启用一次。
+        用的是假数据，不会真的去签到；force=True 让预览不受
+        「签到成功后也弹通知」开关的影响——关掉成功通知的用户
+        仍然可以主动看看它长什么样。
         """
         def job():
             self._ensure_toast()
             ok = core.notify_sign_result(self._sample_result(status),
-                                         source="通知样例")
+                                         source="通知样例", force=True)
             what = "签到成功" if status == "ok" else "签到失败"
             return {"ok": bool(ok),
                     "message": ("%s样例已发送，请看屏幕右下角" % what
