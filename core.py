@@ -885,28 +885,60 @@ def _notify_balloon(title: str, message: str, level: str = "warn") -> bool:
 
 # 需要用户处理的状态（要重新登录 / 签到失败）
 BAD_SIGN_STATUS = ("invalid_cookie", "not_logged_in", "failed", "error")
+# 真的"签了一次"的状态（"info" 只是查状态、没有发起签到，不发通知）
+SIGN_DONE_STATUS = ("claimed", "already") + BAD_SIGN_STATUS
 
 
-def notify_sign_failure(result: dict, source: str = "自动签到") -> bool:
-    """把"签到没成功"这件事弹成 Windows 通知，让用户下次开机能立刻发现。"""
+def notify_sign_result(result: dict, source: str = "") -> bool:
+    """每次签到结束后都弹一条 Windows 通知——成功、已签过、失败都算。
+
+    手动签到、开机自动签到、计划任务签到都会走到这里，用户随时知道
+    "今天签上了 / 早就签过了 / 哪个游戏失败了"。纯状态查询（force_info，
+    没有真的发起签到）不发通知，免得每次刷新状态都打扰用户。
+    """
     games = (result or {}).get("games") or {}
-    bad = [(g.get("name") or k, (g.get("message") or "").strip())
-           for k, g in games.items() if (g or {}).get("status") in BAD_SIGN_STATUS]
-    if not bad:
+    if not games:
         return False
+    if not any((g or {}).get("status") in SIGN_DONE_STATUS for g in games.values()):
+        return False                      # 全是 info：只查了状态，没签到
 
-    need_login = any((games.get(k) or {}).get("status") in ("invalid_cookie", "not_logged_in")
-                     for k in games)
-    if need_login:
-        title = "米游社签到失败：" + "、".join(n for n, _ in bad) + " 需要重新登录"
-        body = ("登录凭据已失效，签到没完成。\n"
-                "请打开「米游社签到助手」，点【登录米游社】重新登录一次。")
+    ok_lines, bad = [], []
+    for k in GAME_KEYS:                   # 按固定顺序输出，通知里游戏排序稳定
+        g = games.get(k) or {}
+        st = g.get("status")
+        if st not in SIGN_DONE_STATUS:
+            continue
+        name = g.get("name") or game_name(k)
+        days = g.get("days")
+        tail = "（本月累计 %s 天）" % days if days not in (None, "") else ""
+        if st == "claimed":
+            ok_lines.append("【%s】%s%s"
+                            % (name, g.get("message") or "签到成功", tail))
+        elif st == "already":
+            ok_lines.append("【%s】今天已经签到过了%s" % (name, tail))
+        else:
+            bad.append((name, (g.get("message") or "").strip()))
+
+    need_login = any((games.get(k) or {}).get("status")
+                     in ("invalid_cookie", "not_logged_in") for k in games)
+    if bad:
+        prefix = "米游社签到失败" if not ok_lines else "米游社签到部分完成"
+        title = "%s：%s%s" % (prefix, "、".join(n for n, _ in bad),
+                              " 需要重新登录" if need_login else "")
+        if need_login:
+            body = ("登录凭据已失效，有游戏没签成。\n"
+                    "请打开「米游社签到助手」，点【登录米游社】重新登录一次。")
+            if ok_lines:
+                body += "\n" + "；".join(ok_lines)
+        else:
+            body = "；".join(ok_lines + [m for _, m in bad if m]) \
+                or "请打开「米游社签到助手」查看运行日志。"
     else:
-        title = "米游社签到失败：" + "、".join(n for n, _ in bad)
-        body = "；".join(m for _, m in bad if m) or "请打开「米游社签到助手」查看日志。"
+        title = "米游社签到完成"
+        body = "；".join(ok_lines) or "今天已经没有需要签到的游戏了。"
     if source:
-        body = "%s\n（%s）" % (body, source)
-    return notify(title, body, level="error")
+        body = "%s（%s）" % (body, source)
+    return notify(title, body, level="error" if bad else "info")
 
 
 # ---------------------------------------------------------------- 客户端

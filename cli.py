@@ -254,10 +254,10 @@ def main():
     elif args.action == "sign":
         res = core.sign_once(keys, False)
         core.write_log("结果：" + core.summarize(res))
-        # 定时任务在后台跑（没有窗口），失败必须弹 Windows 系统通知，
-        # 否则用户开机后根本不知道今天没签上、或者 cookie 已经过期。
-        if res.get("ok") is not True:
-            core.notify_sign_failure(res, source="每日自动签到")
+        # 计划任务在后台跑（没有窗口），每次签完都弹 Windows 系统通知：
+        # 成功让用户知道今天签上了；失败则让用户下次开电脑立刻发现
+        # （cookie 过期、需要重新登录等）。status 只查状态，不会走到这里。
+        core.notify_sign_result(res, source="每日自动签到")
         sys.exit(0 if res.get("ok") else 1)
     elif args.action == "status":
         res = core.sign_once(keys, True)

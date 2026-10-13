@@ -22,7 +22,7 @@ from pathlib import Path
 BASE = Path(__file__).resolve().parent
 APP_TITLE = "米游社签到助手"
 APP_SUB = "原神 · 崩坏：星穹铁道 · 绝区零 · 米游社每日签到"
-VERSION = "3.0.1"
+VERSION = "3.1.0"
 
 # 4K 屏上 Windows 缩放常为 150%~200%。进程若未声明 DPI 感知，系统会把整个
 # 窗口当位图放大——字体边缘被插值糊掉，这是界面发虚的根因。
@@ -516,23 +516,26 @@ class App:
             self.set_status(text, ACCENT)
 
     # ------------------------------------------------------------ 线程与消息泵
-    def run_bg(self, fn, done_status=None, is_login=False):
+    def run_bg(self, fn, done_status=None, is_login=False, notify_source=""):
         if self.busy:
             return
         # 看门狗：万一线程意外没了（没回结果），也不能让界面永久卡在"执行中…"
         timeout = 720 if is_login else 300
         self._op_deadline = time.monotonic() + timeout
         self.set_busy(True, "执行中…")
-        self._spawn(fn, done_status, is_login=is_login)
+        self._spawn(fn, done_status, is_login=is_login,
+                    notify_source=notify_source)
 
-    def _spawn(self, fn, done_status, silent=False, is_login=False):
+    def _spawn(self, fn, done_status, silent=False, is_login=False,
+               notify_source=""):
         def worker():
             try:
                 res = fn()
             except BaseException as e:  # noqa: BLE001 - 任何异常都必须变回结果，否则界面卡死
                 res = {"ok": False, "message": "%s: %s" % (type(e).__name__, e)}
             try:
-                self.q.put(("done", res, done_status, silent, is_login))
+                self.q.put(("done", res, done_status, silent, is_login,
+                            notify_source))
             except BaseException:  # noqa: BLE001
                 pass
 
@@ -548,9 +551,11 @@ class App:
         done_status = item[2] if len(item) > 2 else None
         silent = item[3] if len(item) > 3 else False
         is_login = item[4] if len(item) > 4 else False
+        notify_source = item[5] if len(item) > 5 else ""
         self._op_deadline = None
         self.set_busy(False)
-        self._after_run(res, done_status, silent=silent, is_login=is_login)
+        self._after_run(res, done_status, silent=silent, is_login=is_login,
+                        notify_source=notify_source)
 
     def _pump(self):
         try:
@@ -646,29 +651,38 @@ class App:
                 core.fetch_accounts(self._log_cb)
             return res
         if silent:
-            self._spawn(job, None, silent=True)
+            # 开机时的静默刷新：当天没签的游戏会直接签掉，也算"自动签到"
+            self._spawn(job, None, silent=True, notify_source="开机自动签到")
         else:
-            self.run_bg(job, "状态已刷新")
+            self.run_bg(job, "状态已刷新", notify_source="手动刷新")
 
-    def _notify_failure(self, res):
-        """签到没成时在右下角提醒（先试系统通知，被拦就自绘浮层），并准备好"下一步"。
+    def _notify_result(self, res, source=""):
+        """签到结束后在右下角提醒（成功也提醒；先试系统通知，被拦就自绘浮层）。
 
         注意：提醒要走后台线程。右下角浮层会自己跑 20 秒消息循环，
         如果放在界面主线程里调用，整个窗口会卡住 20 秒。
-        这里也刻意不再用程序内弹窗：重新登录的入口就在界面上
-        （右上角提示 + 【登录米游社】按钮），不必打断用户。
+        失败提醒 10 分钟内节流（静默刷新可能连续触发）；成功提醒不节流——
+        每次手动 / 自动签到都应该有一条反馈。
+        纯状态查询（没有真的签到）由 core.notify_sign_result 过滤掉。
         """
-        now = time.monotonic()
-        if now - self._notified_fail_at < 600:      # 10 分钟内不重复提醒
+        games = (res or {}).get("games") or {}
+        if not games:
             return
-        self._notified_fail_at = now
-        # 用户看到提醒后自然会点【登录米游社】，登录成功就自动补签一次
-        self._sign_after_login = True
+        bad = any((g or {}).get("status") in core.BAD_SIGN_STATUS
+                  for g in games.values())
+        if bad:
+            now = time.monotonic()
+            if now - self._notified_fail_at < 600:      # 10 分钟内不重复提醒
+                return
+            self._notified_fail_at = now
+            # 用户看到提醒后自然会点【登录米游社】，登录成功就自动补签一次
+            self._sign_after_login = True
         threading.Thread(
-            target=lambda: core.notify_sign_failure(res, source="米游社签到助手"),
+            target=lambda: core.notify_sign_result(res, source=source),
             daemon=True).start()
 
-    def _after_run(self, res, done_status, silent=False, is_login=False):
+    def _after_run(self, res, done_status, silent=False, is_login=False,
+                   notify_source=""):
         self._render()
         res = res or {}
 
@@ -677,7 +691,7 @@ class App:
             if res.get("ok") and self._sign_after_login:
                 self._sign_after_login = False
                 self.set_status("登录成功，正在自动补签一次…", ACCENT)
-                self.do_sign_all()
+                self.do_sign_all("登录后自动补签")
                 return
             self.set_status(self._brief(res, "登录流程结束"),
                             OK if res.get("ok") else BAD)
@@ -699,10 +713,9 @@ class App:
             # 之前只认 games，导致登录失败也显示灰色，很容易被当成没事。
             self.set_status(self._brief(res, done_status or "操作失败"), BAD)
 
-        # 有游戏没签成 → 弹系统通知，让用户（尤其是不在电脑前时）也能发现。
-        # 静默刷新时也弹，但同样受 10 分钟节流保护，不会刷屏。
-        if bad:
-            self._notify_failure(res)
+        # 每次签到结束后都弹一条系统通知（成功也让用户知道签上了）。
+        # 静默刷新（开机自动签到）也弹；纯状态查询由 core 里过滤，不会打扰。
+        self._notify_result(res, notify_source)
 
     @staticmethod
     def _brief(res, fallback=""):
@@ -722,13 +735,14 @@ class App:
         return text or fallback
 
     # ------------------------------------------------------------ 具体动作
-    def do_sign_all(self):
+    def do_sign_all(self, source="手动签到"):
         picked = core.selected_games()
         if len(picked) == 1:
             label = "%s 签到完成" % core.game_name(picked[0])
         else:
             label = "%d 个游戏签到完成" % len(picked)
-        self.run_bg(lambda: core.sign_once(None, False, self._log_cb), label)
+        self.run_bg(lambda: core.sign_once(None, False, self._log_cb), label,
+                    notify_source=source)
 
     def on_game_toggled(self, key, flag):
         """勾选框变动：立刻落盘 + 刷新卡片样式（下次签到/定时任务都用这个选择）。"""
@@ -762,7 +776,7 @@ class App:
     def do_sign_one(self, key):
         name = core.game_name(key)
         self.run_bg(lambda: core.sign_once([key], False, self._log_cb),
-                    "%s 签到完成" % name)
+                    "%s 签到完成" % name, notify_source="手动签到")
 
     def do_login(self, skip_confirm=False):
         if core.local_state().get("cred_ok") and not skip_confirm:
