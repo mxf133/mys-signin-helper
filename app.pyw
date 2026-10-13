@@ -22,7 +22,7 @@ from pathlib import Path
 BASE = Path(__file__).resolve().parent
 APP_TITLE = "米游社签到助手"
 APP_SUB = "原神 · 崩坏：星穹铁道 · 绝区零 · 米游社每日签到"
-VERSION = "3.1.0"
+VERSION = "3.1.1"
 
 # 4K 屏上 Windows 缩放常为 150%~200%。进程若未声明 DPI 感知，系统会把整个
 # 窗口当位图放大——字体边缘被插值糊掉，这是界面发虚的根因。
@@ -446,6 +446,10 @@ class App:
         Btn(lh, "打开日志文件", self.open_log, kind="ghost").pack(side="right")
         Btn(lh, "清空", self.clear_log, kind="ghost").pack(side="right", padx=px(4))
         Btn(lh, "测试通知", self.do_notify_test, kind="ghost").pack(side="right", padx=px(4))
+        Btn(lh, "失败通知样例", self.do_notify_sample_fail,
+            kind="ghost").pack(side="right", padx=px(4))
+        Btn(lh, "成功通知样例", self.do_notify_sample_ok,
+            kind="ghost").pack(side="right", padx=px(4))
 
         wrap = tk.Frame(logf, bg=LOG_BG, highlightbackground=BORDER,
                         highlightthickness=px(1))
@@ -825,23 +829,67 @@ class App:
 
         self.run_bg(job, "自动签到已关闭")
 
-    def do_notify_test(self):
-        """发一条测试提醒，确认"签到失败提醒"能收到。
+    def _ensure_toast(self) -> bool:
+        """确保系统通知可用；不可用时顺手启用一次（便携版常见：没跑过注册）。
 
-        如果还没启用系统通知（便携版常见：没跑过注册），这里会顺手启用一次——
         会弹一个 UAC，日志里会写清楚要做什么，用户点【是】即可。
+        返回 False 表示这次只能靠托盘气泡 / 自绘卡片兜底。
         """
+        if core.toast_registered():
+            return True
+        res = core.setup_toast(self._log_cb)
+        if not res.get("ok"):
+            self._log_cb("系统通知没启用成功，本次改用右下角提醒兜底")
+            return False
+        return True
+
+    def do_notify_test(self):
+        """发一条测试提醒，确认"签到提醒"能收到。"""
         def job():
-            if not core.toast_registered():
-                res = core.setup_toast(self._log_cb)
-                if not res.get("ok"):
-                    self._log_cb("系统通知没启用成功，本次改用右下角提醒兜底")
+            self._ensure_toast()
             ok = core.notify("米游社签到助手 · 通知测试",
-                             "能在右下角看到这条，就说明签到失败提醒可用。")
+                             "能在右下角看到这条，就说明签到提醒可用。")
             return {"ok": bool(ok),
                     "message": ("测试提醒已发送，请看屏幕右下角"
                                 if ok else "提醒没能弹出，详见运行日志")}
         self.run_bg(job, "通知测试完成")
+
+    @staticmethod
+    def _sample_result(status: str) -> dict:
+        """构造一份和各游戏真实签到结果同构的样例数据（只用于通知预览）。"""
+        games = {}
+        for k in (core.selected_games() or list(core.GAME_KEYS)):
+            name = core.game_name(k)
+            if status == "ok":
+                games[k] = {"name": name, "status": "claimed",
+                            "message": "签到成功，获得 签到奖励 ×1", "days": 7}
+            else:
+                games[k] = {"name": name, "status": "invalid_cookie",
+                            "message": ("登录凭据已失效或不完整（游戏签到需要有效的 "
+                                        "cookie_token 会话），请点「登录米游社」重新登录"),
+                            "days": None}
+        return {"ok": status == "ok", "games": games}
+
+    def do_notify_sample(self, status: str):
+        """弹一条签到结果的通知样例（成功 / 失败），看看签完提醒长什么样。
+
+        用的是假数据，不会真的去签到；系统通知没启用时会先尝试启用一次。
+        """
+        def job():
+            self._ensure_toast()
+            ok = core.notify_sign_result(self._sample_result(status),
+                                         source="通知样例")
+            what = "签到成功" if status == "ok" else "签到失败"
+            return {"ok": bool(ok),
+                    "message": ("%s样例已发送，请看屏幕右下角" % what
+                                if ok else "样例没能弹出，详见运行日志")}
+        self.run_bg(job, "通知样例已发送")
+
+    def do_notify_sample_ok(self):
+        self.do_notify_sample("ok")
+
+    def do_notify_sample_fail(self):
+        self.do_notify_sample("fail")
 
     def open_log(self):
         try:
