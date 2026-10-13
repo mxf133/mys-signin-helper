@@ -75,3 +75,6 @@ _*.log
 
 # 换图标前留的旧版备份
 backup/
+
+# WorkBuddy 本地项目数据（记忆/日志等），勿入库
+.workbuddy/
