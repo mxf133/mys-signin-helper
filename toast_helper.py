@@ -135,21 +135,31 @@ def autostart_create(time_str: str, pythonw: str, script: str) -> str:
                             os.environ.get("USERNAME", "")),
     }
     xml_path = Path(os.environ.get("TEMP") or ".") / "mys-task-helper.xml"
+    xml_written = False
     try:
         xml_path.write_text(xml, encoding="utf-16")
+        xml_written = True
     except Exception:
-        xml_path = Path(__file__).resolve().parent / "mys-task-helper.xml"
-        xml_path.write_text(xml, encoding="utf-16")
-    for name in (TASK_NAME,) + ALT_TASK_NAMES:
-        r = _run(["schtasks", "/Create", "/TN", name, "/XML", str(xml_path), "/F"])
-        if r.returncode == 0 and _task_exists(name):
-            notes.append("task:%s" % name)
-            break
-        notes.append("task:%s=%s" % (name, ((r.stdout or "") + (r.stderr or "")).strip()[:60]))
-    try:
-        xml_path.unlink()
-    except OSError:
-        pass
+        fallback = Path(__file__).resolve().parent / "mys-task-helper.xml"
+        try:
+            fallback.write_text(xml, encoding="utf-16")
+            xml_path = fallback
+            xml_written = True
+        except Exception:
+            pass
+    if xml_written:
+        for name in (TASK_NAME,) + ALT_TASK_NAMES:
+            r = _run(["schtasks", "/Create", "/TN", name, "/XML", str(xml_path), "/F"])
+            if r.returncode == 0 and _task_exists(name):
+                notes.append("task:%s" % name)
+                break
+            notes.append("task:%s=%s" % (name, ((r.stdout or "") + (r.stderr or "")).strip()[:60]))
+        try:
+            xml_path.unlink()
+        except OSError:
+            pass
+    else:
+        notes.append("task=FAIL(无法写入临时XML文件)")
     if notes and notes[-1].startswith("task:") and "=" not in notes[-1]:
         return notes[-1]
 
