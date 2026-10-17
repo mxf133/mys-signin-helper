@@ -2448,7 +2448,10 @@ def _latest_tag_via_redirect(timeout: int = UPDATE_TIMEOUT):
 
     req = urllib.request.Request(
         UPDATE_PAGE, method="HEAD",
-        headers={"User-Agent": "MYS-SignIn-Helper/%s" % VERSION})
+        headers={"User-Agent": "MYS-SignIn-Helper/%s" % VERSION,
+                 # releases/latest 的跳转会经过 CDN，刚发版时可能还指向上一版，
+                 # 带上 no-cache 尽量减少这种延迟（几分钟内仍可能滞后，可接受）
+                 "Cache-Control": "no-cache", "Pragma": "no-cache"})
     handlers = [_NoRedirect()]
     proxy = _system_proxy()
     if proxy:
@@ -2488,7 +2491,12 @@ def check_update(timeout: int = UPDATE_TIMEOUT) -> dict:
             errors.append(_net_error_text(e))
 
     if data:
-        latest = latest or str(data.get("tag_name") or "").strip().lstrip("vV")
+        api_tag = str(data.get("tag_name") or "").strip().lstrip("vV")
+        # 两个来源取版本更高的那个：跳转结果可能被 CDN 缓存住（刚发完版时
+        # 还指着上一版），API 拿到的是实时数据，谁新听谁的。
+        if api_tag and (not latest
+                        or _version_tuple(api_tag) > _version_tuple(latest)):
+            latest = api_tag
         notes = (data.get("body") or "").strip()
         url = data.get("html_url") or UPDATE_PAGE
         published = (data.get("published_at") or "")[:10]
