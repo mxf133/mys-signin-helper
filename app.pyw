@@ -1074,7 +1074,10 @@ class App:
 
 # 便携版把图形界面与命令行合在同一个 exe 里：带这些参数时不建窗口，
 # 直接走命令行逻辑。Windows 计划任务就是用 `exe sign` 把签到调起来的。
-CLI_ACTIONS = ("login", "sign", "status", "task", "untask", "doctor", "notify-setup")
+# 注意：cli.py 里 argparse 的 choices 新增动作时，这里必须同步加上，
+# 否则 `exe <新动作>` 会被当成"没带参数"而直接开界面（窗口一直挂着）。
+CLI_ACTIONS = ("login", "sign", "status", "task", "untask", "doctor",
+               "notify-setup", "update")
 
 
 def main():

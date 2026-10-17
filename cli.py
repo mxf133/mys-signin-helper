@@ -228,6 +228,7 @@ def main():
     core.ensure_std_streams()
     ap = argparse.ArgumentParser(
         description="米游社每日签到（原神 / 崩坏：星穹铁道 / 绝区零）")
+    # 新增动作时记得同步 app.pyw 顶部的 CLI_ACTIONS（便携版靠它决定走命令行还是开界面）
     ap.add_argument("action",
                     choices=["login", "sign", "status", "task", "untask", "doctor",
                              "notify-setup", "update"],
