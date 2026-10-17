@@ -88,10 +88,11 @@ cd /d "%~dp0"
 
 
 def read_version() -> str:
+    """版本号的唯一来源是 core.VERSION（界面、检查更新、打包都读它）。"""
     m = re.search(r'^VERSION\s*=\s*"([^"]+)"',
-                  (HERE / "app.pyw").read_text(encoding="utf-8"), re.M)
+                  (HERE / "core.py").read_text(encoding="utf-8"), re.M)
     if not m:
-        raise SystemExit("app.pyw 里没找到 VERSION")
+        raise SystemExit("core.py 里没找到 VERSION")
     return m.group(1)
 
 

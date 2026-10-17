@@ -146,6 +146,7 @@ def doctor():
     L = []
     L.append("米游社签到助手 · 环境自检")
     L.append("=" * 52)
+    L.append("版本          : v%s" % core.VERSION)
     L.append("运行模式      : %s" % ("便携版 exe" if core.is_frozen() else "源码 / Python"))
     L.append("Python 版本   : %s" % sys.version.split()[0])
     L.append("程序目录      : %s" % core.BASE)
@@ -184,6 +185,11 @@ def doctor():
     if d.get("exists"):
         L.append("计划任务      : 已创建（%s，下次 %s）"
                  % (d.get("time"), d.get("next_run")))
+        if d.get("last_result_text"):
+            L.append("上次运行结果  : %s" % d["last_result_text"])
+        hint = core.task_failure_hint(d)
+        if hint:
+            L.append("                ↑ %s" % hint)
     else:
         L.append("计划任务      : 未创建%s"
                  % ("（查询失败 %s）" % d["err"] if d.get("err") else ""))
@@ -224,9 +230,10 @@ def main():
         description="米游社每日签到（原神 / 崩坏：星穹铁道 / 绝区零）")
     ap.add_argument("action",
                     choices=["login", "sign", "status", "task", "untask", "doctor",
-                             "notify-setup"],
+                             "notify-setup", "update"],
                     help="login=登录一次  sign=签到  status=查看状态  "
-                         "task=注册定时任务  untask=删除定时任务  doctor=环境自检")
+                         "task=注册定时任务  untask=删除定时任务  doctor=环境自检  "
+                         "update=检查新版本")
     ap.add_argument("--game", action="append", default=None,
                     choices=["all"] + list(core.GAME_KEYS),
                     help="指定游戏，可重复传入（如 --game genshin --game zzz）；"
@@ -237,6 +244,11 @@ def main():
                     help="仅用于 doctor：自检完再弹一条系统通知，用来确认通知功能可用")
     ap.add_argument("--time", default=None,
                     help="仅用于 task：自动签到时间 HH:MM（默认用设置里的值）")
+    ap.add_argument("--run-level", default=None,
+                    choices=["HighestAvailable", "LeastPrivilege"],
+                    help="仅用于 task：计划任务的权限级别。不提通常规探测"
+                         "（exe 是否被设为以管理员运行 / 凭据是否仅管理员可读），"
+                         "由界面在提权前把结论传进来，避免管理员进程误判")
     args = ap.parse_args()
 
     if not args.game or "all" in args.game:
@@ -263,7 +275,8 @@ def main():
         res = core.sign_once(keys, True)
         sys.exit(0 if res.get("ok") else 1)
     elif args.action == "task":
-        res = core.create_task(args.time or core.load_settings().get("task_time", "09:05"))
+        res = core.create_task(args.time or core.load_settings().get("task_time", "09:05"),
+                               run_level=args.run_level or "")
         # 提权运行时（父进程拿不到返回值）把结论落盘给父进程读
         core.write_task_result(res)
         sys.exit(0 if res.get("ok") else 1)
@@ -274,6 +287,17 @@ def main():
     elif args.action == "notify-setup":
         # 一键启用真正的系统通知（注册通知助手；需要一次管理员权限）
         res = core.setup_toast(lambda m: print(m))
+        sys.exit(0 if res.get("ok") else 1)
+    elif args.action == "update":
+        print("正在检查更新（当前 v%s）..." % core.VERSION)
+        res = core.check_update()
+        print(res.get("message") or "")
+        if res.get("ok") and res.get("has_update"):
+            print("发布页　　：%s" % res.get("url"))
+            if res.get("asset_url"):
+                print("便携版直链：%s" % res.get("asset_url"))
+            if res.get("notes"):
+                print("\n更新说明：\n%s" % res["notes"][:1500])
         sys.exit(0 if res.get("ok") else 1)
     elif args.action == "doctor":
         report = doctor()

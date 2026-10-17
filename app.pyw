@@ -22,7 +22,7 @@ from pathlib import Path
 BASE = Path(__file__).resolve().parent
 APP_TITLE = "米游社签到助手"
 APP_SUB = "原神 · 崩坏：星穹铁道 · 绝区零 · 米游社每日签到"
-VERSION = "3.1.3"
+# 版本号不在这里写死：唯一来源是 core.VERSION（见下方 import core 之后）
 
 # 4K 屏上 Windows 缩放常为 150%~200%。进程若未声明 DPI 感知，系统会把整个
 # 窗口当位图放大——字体边缘被插值糊掉，这是界面发虚的根因。
@@ -127,6 +127,10 @@ _ensure_venv()
 sys.path.insert(0, str(BASE))
 
 import core  # noqa: E402
+
+# 版本号的唯一来源是 core.VERSION——界面、检查更新、打包脚本都读它。
+# 以前在多个文件里各写一份，改版本时很容易漏掉一处。
+VERSION = core.VERSION
 
 # ---------------------------------------------------------------- 配色 / 字体
 BG = "#f3f4f7"
@@ -340,6 +344,8 @@ class App:
         self._load_local()
         self._pump()
         self.root.after(220, lambda: self.refresh(silent=True))
+        # 启动几秒后静默查一次更新：查不到就悄悄算了，有新版本才在状态栏提示
+        self.root.after(3000, lambda: self._start_update_check(silent=True))
 
     # ------------------------------------------------------------ 界面搭建
     def _build(self):
@@ -485,8 +491,17 @@ class App:
         self.status = tk.Label(foot, text="就绪", bg=BG, fg=SUBTEXT,
                                font=F_SMALL, anchor="w")
         self.status.pack(side="left")
-        tk.Label(foot, text="%s v%s · 凭据经 Windows DPAPI 加密" % (APP_TITLE, VERSION),
-                 bg=BG, fg="#b3b8c0", font=F_SMALL).pack(side="right")
+        self.version_lbl = tk.Label(
+            foot, text="%s v%s · 凭据经 Windows DPAPI 加密" % (APP_TITLE, VERSION),
+            bg=BG, fg="#b3b8c0", font=F_SMALL)
+        self.version_lbl.pack(side="right")
+        # 检查更新做成淡色文字链接，比按钮更轻，不抢主操作区的位置
+        self.update_lbl = tk.Label(foot, text="检查更新", bg=BG, fg=ACCENT_D,
+                                   font=F_SMALL, cursor="hand2")
+        self.update_lbl.pack(side="right", padx=(0, px(14)))
+        self.update_lbl.bind("<Button-1>", lambda _e: self.do_check_update())
+        self.update_lbl.bind("<Enter>", lambda _e: self.update_lbl.configure(fg=ACCENT_A))
+        self.update_lbl.bind("<Leave>", lambda _e: self.update_lbl.configure(fg=ACCENT_D))
 
     def _center(self, w, h):
         w, h = px(w), px(h)
@@ -561,6 +576,9 @@ class App:
     def _handle_item(self, item):
         if item[0] == "log":
             self.append_log(item[1])
+            return
+        if item[0] == "update_checked":
+            self._on_update_checked(item[1], bool(item[2]) if len(item) > 2 else False)
             return
         if item[0] != "done":
             return
@@ -646,7 +664,11 @@ class App:
             t = td.get("time") or st.get("task_time") or "09:05"
             if td.get("time") and td.get("mode") == "task":
                 self.time_var.set(td["time"])
-            if td.get("mode") == "startup":
+            bad = core.task_failure_hint(td, short=True)
+            if bad:
+                # 任务状态永远是"就绪"，只有「上次结果」能说明它其实每次都失败
+                self.task_hint.configure(text=bad, fg=BAD)
+            elif td.get("mode") == "startup":
                 # 计划任务被安全软件拦了，走的是启动文件夹方案
                 self.task_hint.configure(
                     text="每日自动签到：已开启（开机启动 · 约 %s）" % t, fg=OK)
@@ -836,7 +858,11 @@ class App:
             res = core.create_task(t, self._log_cb)
             if res.get("ok"):
                 return res
-            return core.create_task_elevated(t, self._log_cb)
+            # create_task 会探测这台机器要不要管理员权限（exe 被设为以管理员运行 /
+            # 凭据只有管理员可读）。要的话把结论带进提权调用，让建出来的任务本身
+            # 就是「使用最高权限运行」，以后每次触发都不会再 740 失败。
+            level = res.get("run_level") or ""
+            return core.create_task_elevated(t, self._log_cb, run_level=level)
 
         self.run_bg(job, "自动签到已开启")
 
@@ -912,6 +938,119 @@ class App:
 
     def do_notify_sample_fail(self):
         self.do_notify_sample("fail")
+
+    # ------------------------------------------------------------ 检查更新
+    def do_check_update(self):
+        """手动点「检查更新」：后台查 GitHub，结果显示在状态栏并弹窗。"""
+        self.set_status("正在检查更新…", ACCENT)
+        self._start_update_check(silent=False)
+
+    def _start_update_check(self, silent: bool):
+        """后台线程查版本——网络慢时绝不能卡住界面，所以走线程 + 消息泵。"""
+        def worker():
+            try:
+                res = core.check_update()
+            except BaseException as e:  # noqa: BLE001
+                res = {"ok": False, "message": "%s: %s" % (type(e).__name__, e)}
+            try:
+                self.q.put(("update_checked", res, silent))
+            except BaseException:  # noqa: BLE001
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_update_checked(self, res, silent=False):
+        res = res or {}
+        from tkinter import messagebox
+
+        if not res.get("ok"):
+            msg = res.get("message") or "检查更新失败"
+            core.write_log("检查更新失败%s：%s" % ("（静默）" if silent else "", msg))
+            if silent:
+                # 开机时的静默检查：连不上就当没这回事，别打扰用户
+                return
+            self.set_status(msg, BAD)
+            messagebox.showinfo("检查更新", msg, parent=self.root)
+            return
+
+        if not res.get("has_update"):
+            self.set_status("已是最新版本 v%s" % res.get("latest"), OK)
+            if not silent:
+                messagebox.showinfo(
+                    "检查更新",
+                    "当前已是最新版本 v%s。" % res.get("current"),
+                    parent=self.root)
+            return
+
+        # 有新版本：状态栏和右下角版本号都标出来；手动检查时再弹详细说明
+        latest = res.get("latest") or ""
+        self.set_status("发现新版本 v%s，点右下角「检查更新」查看" % latest, WARN)
+        try:
+            self.version_lbl.configure(
+                text="%s v%s · 有新版本 v%s" % (APP_TITLE, VERSION, latest),
+                fg=WARN)
+        except Exception:
+            pass
+        core.write_log("检查更新：发现新版本 v%s（当前 v%s）" % (latest, VERSION))
+        if not silent:
+            self._show_update_dialog(res)
+
+    def _show_update_dialog(self, res):
+        """更新说明弹窗：版本号 + 发布说明摘要 + 打开发布页 / 下载。"""
+        import webbrowser
+
+        win = tk.Toplevel(self.root)
+        win.title("发现新版本 v%s" % res.get("latest"))
+        win.configure(bg=CARD)
+        win.transient(self.root)
+        w, h = px(560), px(420)
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+        win.geometry("%dx%d+%d+%d" % (w, h, (sw - w) // 2, (sh - h) // 3))
+        win.minsize(px(460), px(320))
+
+        head = tk.Frame(win, bg=CARD)
+        head.pack(fill="x", padx=px(20), pady=(px(16), px(6)))
+        tk.Label(head, text="发现新版本 v%s" % res.get("latest"), bg=CARD, fg=TEXT,
+                 font=F_GAME, anchor="w").pack(anchor="w")
+        sub = "当前 v%s" % res.get("current")
+        if res.get("published"):
+            sub += " · 发布于 %s" % res["published"]
+        tk.Label(head, text=sub, bg=CARD, fg=SUBTEXT, font=F_SMALL,
+                 anchor="w").pack(anchor="w", pady=(px(3), 0))
+
+        body = tk.Frame(win, bg=LOG_BG, highlightbackground=BORDER,
+                        highlightthickness=px(1))
+        body.pack(fill="both", expand=True, padx=px(20), pady=px(10))
+        txt = tk.Text(body, bg=LOG_BG, fg="#3d4450", font=F_SMALL, bd=0,
+                      relief="flat", wrap="word", padx=px(10), pady=px(8),
+                      highlightthickness=0)
+        txt.pack(side="left", fill="both", expand=True)
+        sb = tk.Scrollbar(body, command=txt.yview, width=px(11))
+        sb.pack(side="right", fill="y")
+        txt.configure(yscrollcommand=sb.set)
+        notes = (res.get("notes") or "").strip()
+        txt.insert("1.0", notes[:4000] if notes else
+                   "（这次发布没有写更新说明，点下方按钮到发布页查看。）")
+        txt.configure(state="disabled")
+
+        btns = tk.Frame(win, bg=CARD)
+        btns.pack(fill="x", padx=px(20), pady=(0, px(16)))
+
+        def open_page(url):
+            try:
+                webbrowser.open(url)
+            except Exception:
+                pass
+
+        if res.get("asset_url"):
+            Btn(btns, "下载新版本", lambda: open_page(res["asset_url"]),
+                kind="primary").pack(side="left")
+        Btn(btns, "打开发布页",
+            lambda: open_page(res.get("url") or core.UPDATE_PAGE),
+            kind="secondary" if res.get("asset_url") else "primary").pack(
+                side="left", padx=(px(8), 0))
+        Btn(btns, "稍后再说", win.destroy, kind="ghost").pack(side="right")
+        win.bind("<Escape>", lambda _e: win.destroy())
 
     def open_log(self):
         try:

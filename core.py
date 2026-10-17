@@ -51,6 +51,13 @@ STATE_FILE = BASE / "state.json"
 SETTINGS_FILE = BASE / "settings.json"
 
 LOGIN_URL = "https://www.miyoushe.com/sr/"
+
+# 版本号：界面标题栏、检查更新、打包脚本都从这里取，避免多处各写一份。
+VERSION = "3.2.0"
+
+# 检查更新要查的仓库（GitHub Releases）。
+GITHUB_REPO = "mxf133/mys-signin-helper"
+
 TASK_NAME = "MYS-DailySignIn"
 # 备用任务名：安全软件可能把某个名字记进黑名单（同名怎么都建不上），
 # 换个名字就能成功，所以注册失败时自动换个名字再试。
@@ -1487,7 +1494,7 @@ _TASK_XML = """<?xml version="1.0" encoding="UTF-16"?>
     <Principal id="Author">
       <UserId>%(user)s</UserId>
       <LogonType>InteractiveToken</LogonType>
-      <RunLevel>LeastPrivilege</RunLevel>
+      <RunLevel>%(run_level)s</RunLevel>
     </Principal>
   </Principals>
 </Task>
@@ -1500,6 +1507,102 @@ def _is_admin() -> bool:
         return bool(ctypes.windll.shell32.IsUserAnAdmin())
     except Exception:
         return False
+
+
+# ------------------------------------------------ 计划任务该用哪种权限级别
+#
+# 计划任务默认用「最少权限」(LeastPrivilege) 运行，正常情况下就够了。但有两种
+# 机器上必须以管理员身份跑，否则任务每次触发都会立刻失败：
+#
+#   1. 程序 exe 被勾了「以管理员身份运行」（兼容性设置）——Windows 会把它记进
+#      HKCU\...\AppCompatFlags\Layers，值是 "~ RUNASADMIN"。这种 exe 被普通权限
+#      启动时直接返回 WinError 740（请求的操作需要提升），任务计划程序记录的
+#      上次结果是 0x800702E4，进程连一行日志都写不出来。
+#   2. 凭据/设置文件只有管理员能读（便携版如果曾用管理员权限跑过，写出来的
+#      cookie.enc、settings.json 可能继承到"仅管理员可读"的 ACL）。这种时候
+#      任务能启动，但读不到登录态，签到必然失败。
+#
+# 所以注册任务前先探测一遍，需要提权就把 XML 里的 RunLevel 写成
+# HighestAvailable，这样任务运行时不再需要 UAC 弹窗，也不会 740。
+
+_LAYERS_KEY = r"Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers"
+
+
+def _norm_path(p: str) -> str:
+    """规范化路径用于比较：去掉引号、统一大小写、转绝对路径。
+
+    注册表里的值名有时带引号（"C:\\…\\x.exe"），直接 abspath 会被当成
+    相对路径算出个乱七八糟的结果。
+    """
+    s = str(p or "").strip().strip('"')
+    try:
+        return os.path.normcase(os.path.abspath(s))
+    except Exception:
+        return os.path.normcase(s)
+
+
+def _compat_runas_marked(path: str) -> bool:
+    """目标程序是否被勾选了「以管理员身份运行」（兼容性 → 特权等级）。"""
+    if not path:
+        return False
+    try:
+        import winreg
+    except Exception:
+        return False
+
+    target = _norm_path(path)
+    # 兼容性设置里可能存短路径（8.3）或带引号的写法，所以逐个值名比对；
+    # HKCU 存的是用户自己勾的，HKLM 存的是管理员为所有用户设的。
+    for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        try:
+            with winreg.OpenKey(hive, _LAYERS_KEY) as k:
+                i = 0
+                while True:
+                    try:
+                        name, value, _ = winreg.EnumValue(k, i)
+                    except OSError:
+                        break
+                    i += 1
+                    if "RUNASADMIN" not in str(value).upper():
+                        continue
+                    if _norm_path(name) == target:
+                        return True
+        except OSError:
+            continue
+    return False
+
+
+def _can_read(path: Path) -> bool:
+    try:
+        with open(path, "rb") as f:
+            f.read(1)
+        return True
+    except Exception:
+        return False
+
+
+def _task_needs_elevation() -> bool:
+    """自动签到的子进程是否必须以管理员身份运行。"""
+    if is_frozen():
+        target = sys.executable
+    else:
+        target = _pythonw_exe() or sys.executable
+    if _compat_runas_marked(target):
+        return True
+
+    # 凭据/设置只有管理员读得到 → 普通权限跑起来也是白跑。
+    # 注意要在"当前不是管理员"的前提下判断：管理员进程读什么都成功，
+    # 用它来判断会永远得出"没问题"的错误结论。
+    if not _is_admin():
+        for p in (CRED_FILE, SETTINGS_FILE):
+            if p.exists() and not _can_read(p):
+                return True
+    return False
+
+
+def _task_run_level() -> str:
+    """计划任务该用的权限级别：需要用管理员跑时才写 HighestAvailable。"""
+    return "HighestAvailable" if _task_needs_elevation() else "LeastPrivilege"
 
 
 def _looks_missing(text: str, admin: bool = False) -> bool:
@@ -1645,8 +1748,45 @@ def task_exists() -> bool:
     return task_detail().get("exists", False)
 
 
+TASK_RUNNING = 267009          # 0x41301：任务正在运行，不算失败
+
+
+def _parse_task_result(raw: str):
+    """把 schtasks 的「上次结果」转成整数；"从未运行"返回 None。"""
+    s = (raw or "").strip()
+    if not s or "从未" in s or "尚未" in s or s.lower().startswith("never"):
+        return None
+    try:
+        return int(s, 16) if s.lower().startswith("0x") else int(s)
+    except ValueError:
+        return None
+
+
+def task_failure_hint(td: dict, short: bool = False) -> str:
+    """把「上次运行结果」翻译成一句人话；一切正常时返回空字符串。
+
+    任务状态永远显示"就绪"，所以只看 State 会以为自动签到好好的，实际上它
+    可能每天都因 740 失败、一行日志都写不出来。界面必须把上次结果摆出来。
+    short=True 给界面用（状态栏那一行放不下长句），否则给自检报告用。
+    """
+    code = (td or {}).get("last_result")
+    if code is None or code == 0 or code == TASK_RUNNING:
+        return ""
+    reasons = {
+        0x800702E4: ("需要管理员权限（740），点一次「开启 / 更新」重建任务即可",
+                     "需要管理员权限，点「开启 / 更新」修复"),
+        0x80070005: ("权限不足（拒绝访问）", "权限不足，重开自动签到"),
+        0x80070424: ("任务计划程序服务不可用", "任务计划服务不可用"),
+        0x41303: ("任务从未运行过", "任务从未运行过"),
+    }
+    pair = reasons.get(code)
+    if pair:
+        return "上次自动签到失败：%s" % (pair[1] if short else pair[0])
+    return "上次自动签到失败：错误码 0x%X" % code
+
+
 def task_detail(use_cache: bool = True) -> dict:
-    """返回 {exists, time, next_run, mode}
+    """返回 {exists, time, next_run, mode, last_result, last_result_text}
 
     mode: "task" = 系统计划任务；"runkey"/"startup" = 备用开机启动方式。
     """
@@ -1687,6 +1827,13 @@ def task_detail(use_cache: bool = True) -> dict:
             m2 = re.search(r"(?:下次运行时间|Next Run Time):\s*([^\r\n]+)", text)
             if m2:
                 out["next_run"] = m2.group(1).strip()
+            # 「上次结果」是判断自动签到到底有没有跑成功的唯一可靠证据：
+            # 任务状态永远显示"就绪"，哪怕它每次触发都失败。
+            m3 = re.search(r"(?:上次结果|Last Result):\s*([^\r\n]+)", text)
+            if m3:
+                raw = m3.group(1).strip()
+                out["last_result_text"] = raw
+                out["last_result"] = _parse_task_result(raw)
         except Exception:
             pass
     elif _run_key_enabled():
@@ -1882,16 +2029,23 @@ def setup_toast(on_log=None) -> dict:
     return {"ok": False, "message": msg}
 
 
-def create_task_elevated(time_str: str = "09:05", on_log=None) -> dict:
-    """用管理员权限注册计划任务（UAC 一次），成功后按子进程写的结论更新状态。"""
+def create_task_elevated(time_str: str = "09:05", on_log=None,
+                         run_level: str = "") -> dict:
+    """用管理员权限注册计划任务（UAC 一次），成功后按子进程写的结论更新状态。
+
+    run_level 传 "HighestAvailable" 时，提权子进程建出来的任务本身就是
+    「使用最高权限运行」，之后每次触发都不需要 UAC，也不会因 740 失败。
+    """
     emit = _emit_factory(on_log)
-    emit("普通权限被系统拒绝，正在请求管理员权限——"
-         "请在弹出的 UAC 窗口点「是」（只此一次）。")
+    emit("正在请求管理员权限——请在弹出的 UAC 窗口点「是」（只此一次）。")
     try:
         TASK_RESULT_FILE.unlink()
     except OSError:
         pass
-    ok, detail = run_elevated('task --time %s' % time_str)
+    args = "task --time %s" % time_str
+    if run_level in ("HighestAvailable", "LeastPrivilege"):
+        args += " --run-level %s" % run_level
+    ok, detail = run_elevated(args)
     _TASK_CACHE["at"] = 0.0
     if not ok:
         emit(detail)
@@ -1988,12 +2142,28 @@ def _pythonw_exe() -> str:
     return ""
 
 
-def create_task(time_str: str = "09:05", on_log=None) -> dict:
+def create_task(time_str: str = "09:05", on_log=None,
+                run_level: str = "") -> dict:
     emit = _emit_factory(on_log)
     if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", time_str or ""):
         msg = "时间格式不对，应为 HH:MM（例如 09:05）"
         emit(msg)
         return {"ok": False, "message": msg}
+
+    # 决定任务的权限级别。提权子进程里判断"凭据是否只有管理员可读"是不可靠的
+    # （管理员读什么都成功），所以由调用方把普通权限下探测到的结论显式传进来。
+    level = run_level if run_level in ("HighestAvailable", "LeastPrivilege") \
+        else _task_run_level()
+
+    # 需要管理员权限、当前却不是：先别做注定失败的尝试，直接让上层请求 UAC。
+    if level == "HighestAvailable" and not _is_admin():
+        msg = ("这台机器上的签到程序需要管理员权限才能正常运行"
+               "（程序被设为「以管理员身份运行」，或凭据文件仅管理员可读）。"
+               "接下来会请求一次管理员权限来注册计划任务，请在 UAC 窗口点「是」。")
+        emit(msg)
+        return {"ok": False, "message": msg, "need_elevated": True,
+                "run_level": "HighestAvailable",
+                "status_text": "需要管理员权限，正在请求提权…"}
 
     # 清理历史遗留的任务名，避免重复签到
     for n in LEGACY_TASK_NAMES:
@@ -2019,6 +2189,7 @@ def create_task(time_str: str = "09:05", on_log=None) -> dict:
             "arguments": _xml_escape(args),
             "user": "%s\\%s" % (os.environ.get("USERDOMAIN", ""),
                                 os.environ.get("USERNAME", "")),
+            "run_level": level,
         }
         import tempfile
         fd, xml_path = tempfile.mkstemp(suffix=".xml", prefix="mys-task-")
@@ -2046,8 +2217,11 @@ def create_task(time_str: str = "09:05", on_log=None) -> dict:
         save_settings(task_time=time_str, autostart="task")
         msg = "已开启每日自动签到：每天 %s 后台签到 %s" % (
             time_str, "、".join(game_name(k) for k in selected_games()))
+        if level == "HighestAvailable":
+            msg += "（已按本机情况设为管理员权限运行，运行时不会弹 UAC）"
         emit(msg)
-        return {"ok": True, "message": msg, "mode": "task", "task_name": created_name}
+        return {"ok": True, "message": msg, "mode": "task",
+                "task_name": created_name, "run_level": level}
 
     # 第二条路：交给"打包助手"（已安装应用）试一次——有些机器只拦 python，
     # 却放行已安装的打包应用，这样就不用麻烦用户点 UAC。
@@ -2180,4 +2354,166 @@ def local_state() -> dict:
         "notify_on_success": notify_on_success(),
         "selected": sel,
         "game_list": detail,
+    }
+
+
+# ---------------------------------------------------------------- 检查更新
+#
+# 只查 GitHub 的 releases/latest，不下载、不自动替换——把"有新版本"和发布页
+# 告诉用户就够了。国内直连 GitHub API 经常超时，所以：超时给 8 秒，失败只返回
+# 一句话，绝不影响签到主流程；请求会走系统代理，开了代理也能查。
+
+UPDATE_API = "https://api.github.com/repos/%s/releases/latest" % GITHUB_REPO
+UPDATE_PAGE = "https://github.com/%s/releases/latest" % GITHUB_REPO
+UPDATE_TIMEOUT = 8
+
+
+def _version_tuple(text: str) -> tuple:
+    """"3.2.0" -> (3, 2, 0)，方便比较大小；非数字部分忽略。"""
+    nums = re.findall(r"\d+", str(text or ""))
+    return tuple(int(n) for n in nums[:3]) or (0,)
+
+
+def _system_proxy() -> str:
+    """读 Windows 系统代理（"设置 → 网络和 Internet → 代理"里填的那个）。
+
+    urllib 默认只看 http_proxy 环境变量，而绝大多数人是在系统设置里填的，
+    所以要自己从注册表读，否则开着代理也查不到更新。
+    """
+    try:
+        import winreg
+        with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Internet Settings") as k:
+            enable = winreg.QueryValueEx(k, "ProxyEnable")[0]
+            server = str(winreg.QueryValueEx(k, "ProxyServer")[0] or "")
+    except Exception:
+        return ""
+    if not enable or not server:
+        return ""
+    # ProxyServer 可能是 "127.0.0.1:7890"，也可能是
+    # "http=127.0.0.1:7890;https=127.0.0.1:7890"
+    for part in server.split(";"):
+        part = part.strip()
+        if "=" in part:
+            scheme, _, addr = part.partition("=")
+            if scheme.strip().lower() in ("https", "http") and addr.strip():
+                return addr.strip()
+        elif part:
+            return part
+    return ""
+
+
+def _http_get_json(url: str, timeout: int = UPDATE_TIMEOUT) -> dict:
+    import urllib.request
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "MYS-SignIn-Helper/%s (+https://github.com/%s)"
+                      % (VERSION, GITHUB_REPO),
+        "Accept": "application/vnd.github+json",
+    })
+    handlers = []
+    proxy = _system_proxy()
+    if proxy:
+        handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+    opener = urllib.request.build_opener(*handlers)
+    with opener.open(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8", "replace"))
+
+
+def _net_error_text(e: Exception) -> str:
+    """把网络异常翻成用户看得懂的一句话。"""
+    text = "%s: %s" % (type(e).__name__, e)
+    low = text.lower()
+    if "timed out" in low or "timeout" in low:
+        return "检查更新超时（GitHub 在国内经常连不上，稍后再试或开代理）"
+    if "getaddrinfo" in low or "name or service" in low or "11001" in text:
+        return "检查更新失败：解析不了 GitHub 域名（网络不通或被拦截）"
+    if "403" in text or "rate limit" in low:
+        return "检查更新失败：GitHub 接口限流，过一会儿再试"
+    return "检查更新失败：%s" % text[:120]
+
+
+def _latest_tag_via_redirect(timeout: int = UPDATE_TIMEOUT):
+    """用 github.com/<repo>/releases/latest 的 302 跳转取最新 tag。
+
+    比 REST API 稳得多：API 对未认证请求限流（同一出口 IP 每小时 60 次，
+    开代理时很容易被同 IP 的其他人耗光），而网页跳转不受这个限制。
+    """
+    import urllib.error
+    import urllib.request
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+
+    req = urllib.request.Request(
+        UPDATE_PAGE, method="HEAD",
+        headers={"User-Agent": "MYS-SignIn-Helper/%s" % VERSION})
+    handlers = [_NoRedirect()]
+    proxy = _system_proxy()
+    if proxy:
+        handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+    opener = urllib.request.build_opener(*handlers)
+    try:
+        with opener.open(req, timeout=timeout) as r:
+            location = r.headers.get("Location") or r.url or ""
+    except urllib.error.HTTPError as e:
+        location = e.headers.get("Location") or ""
+    m = re.search(r"/tag/([^/?#]+)", location or "")
+    return m.group(1).strip() if m else ""
+
+
+def check_update(timeout: int = UPDATE_TIMEOUT) -> dict:
+    """查询 GitHub 上的最新版本。
+
+    返回 {ok, current, latest, has_update, url, notes, published, asset_url, message}。
+    ok=False 表示"查不到"（断网 / 超时 / 被墙），不等于"没有新版本"。
+    """
+    errors = []
+
+    # 主路径：网页跳转（不限流）
+    latest = ""
+    try:
+        latest = _latest_tag_via_redirect(timeout).lstrip("vV")
+    except Exception as e:
+        errors.append(_net_error_text(e))
+
+    # 补充信息（发布说明、下载直链）：API 失败不影响"有没有新版本"这个结论
+    notes, url, published, asset_url = "", UPDATE_PAGE, "", ""
+    data = None
+    try:
+        data = _http_get_json(UPDATE_API, timeout=timeout)
+    except Exception as e:
+        if not latest:
+            errors.append(_net_error_text(e))
+
+    if data:
+        latest = latest or str(data.get("tag_name") or "").strip().lstrip("vV")
+        notes = (data.get("body") or "").strip()
+        url = data.get("html_url") or UPDATE_PAGE
+        published = (data.get("published_at") or "")[:10]
+        for a in (data.get("assets") or []):     # 优先给便携版 zip 的直链
+            name = str((a or {}).get("name") or "").lower()
+            if name.endswith(".zip") and "portable" in name:
+                asset_url = a.get("browser_download_url") or ""
+                break
+        if not asset_url and data.get("assets"):
+            asset_url = (data["assets"][0] or {}).get("browser_download_url") or ""
+
+    if not latest:
+        return {"ok": False, "current": VERSION,
+                "message": errors[-1] if errors else "没能从 GitHub 取到版本号"}
+
+    has_update = _version_tuple(latest) > _version_tuple(VERSION)
+    return {
+        "ok": True,
+        "current": VERSION,
+        "latest": latest,
+        "has_update": has_update,
+        "url": url,
+        "notes": notes,
+        "published": published,
+        "asset_url": asset_url,
+        "message": ("发现新版本 v%s（当前 v%s）" % (latest, VERSION) if has_update
+                    else "已是最新版本（v%s）" % VERSION),
     }
