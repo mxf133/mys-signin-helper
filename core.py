@@ -53,7 +53,7 @@ SETTINGS_FILE = BASE / "settings.json"
 LOGIN_URL = "https://www.miyoushe.com/sr/"
 
 # 版本号：界面标题栏、检查更新、打包脚本都从这里取，避免多处各写一份。
-VERSION = "3.2.0"
+VERSION = "3.2.1"
 
 # 检查更新要查的仓库（GitHub Releases）。
 GITHUB_REPO = "mxf133/mys-signin-helper"
@@ -1507,6 +1507,19 @@ def _is_admin() -> bool:
         return bool(ctypes.windll.shell32.IsUserAnAdmin())
     except Exception:
         return False
+
+
+def is_admin() -> bool:
+    """对外暴露的权限判断（界面顶部徽标、自检报告用）。
+
+    普通权限下签到本身照常能用，但注册 / 删除计划任务会被系统拒绝
+    （于是程序要弹一次 UAC），所以界面上要让用户一眼看到当前是什么身份。
+    """
+    return _is_admin()
+
+
+def admin_label() -> str:
+    return "管理员权限" if is_admin() else "普通权限"
 
 
 # ------------------------------------------------ 计划任务该用哪种权限级别

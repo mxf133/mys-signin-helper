@@ -148,6 +148,7 @@ def doctor():
     L.append("=" * 52)
     L.append("版本          : v%s" % core.VERSION)
     L.append("运行模式      : %s" % ("便携版 exe" if core.is_frozen() else "源码 / Python"))
+    L.append("权限级别      : %s" % core.admin_label())
     L.append("Python 版本   : %s" % sys.version.split()[0])
     L.append("程序目录      : %s" % core.BASE)
 

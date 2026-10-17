@@ -375,9 +375,22 @@ class App:
                  anchor="w").pack(anchor="w")
         tk.Label(txt, text=APP_SUB, bg=CARD, fg=SUBTEXT, font=F_SUB,
                  anchor="w").pack(anchor="w")
-        self.account = tk.Label(inner, text="", bg=CARD, fg=SUBTEXT,
+        # 右上角：账号信息 + 两枚常驻状态徽标（自动签到开没开 / 当前权限）
+        meta = tk.Frame(inner, bg=CARD)
+        meta.pack(side="right")
+        self.account = tk.Label(meta, text="", bg=CARD, fg=SUBTEXT,
                                 font=F_SMALL, anchor="e", justify="right")
-        self.account.pack(side="right")
+        self.account.pack(anchor="e")
+        badges = tk.Frame(meta, bg=CARD)
+        badges.pack(anchor="e", pady=(px(4), 0))
+        self.task_badge = tk.Label(badges, text="自动签到：读取中", bg=CARD,
+                                   fg=SUBTEXT, font=F_SMALL)
+        self.task_badge.pack(side="left")
+        tk.Label(badges, text="｜", bg=CARD, fg=HINT,
+                 font=F_SMALL).pack(side="left", padx=px(5))
+        self.admin_badge = tk.Label(badges, text="权限：读取中", bg=CARD,
+                                    fg=SUBTEXT, font=F_SMALL)
+        self.admin_badge.pack(side="left")
         tk.Frame(r, bg=BORDER, height=px(1)).grid(row=0, column=0, sticky="sew")
 
         # ---- 各游戏状态卡片
@@ -676,6 +689,35 @@ class App:
                 self.task_hint.configure(text="每日自动签到：已开启 · 每天 %s" % t, fg=OK)
         else:
             self.task_hint.configure(text="每日自动签到：未开启", fg=SUBTEXT)
+
+        self._render_badges(td)
+
+    def _render_badges(self, td):
+        """顶部常驻的两枚徽标：自动签到状态 / 当前进程权限。
+
+        这两件事都属于"看起来没事、其实已经坏了"的重灾区：任务可以存在、
+        状态永远是"就绪"，但每次触发都 740 失败；程序可能只是普通权限，
+        用户却以为定时设置改不了。所以放在标题栏，不进日志也能一眼看到。
+        """
+        td = td or {}
+        if td.get("exists"):
+            t = td.get("time") or self.time_var.get() or ""
+            if core.task_failure_hint(td, short=True):
+                self.task_badge.configure(text="自动签到：上次失败", fg=BAD)
+            elif td.get("mode") in ("startup", "runkey"):
+                self.task_badge.configure(text="自动签到：开机启动", fg=OK)
+            elif t:
+                self.task_badge.configure(text="自动签到：已开启 %s" % t, fg=OK)
+            else:
+                self.task_badge.configure(text="自动签到：已开启", fg=OK)
+        else:
+            self.task_badge.configure(text="自动签到：未开启", fg=SUBTEXT)
+
+        # 普通权限不是错误（签到照常能用），但注册/删除计划任务需要 UAC，
+        # 用橙色提醒一下当前身份，免得用户以为按钮坏了。
+        self.admin_badge.configure(
+            text=core.admin_label(),
+            fg=OK if core.is_admin() else WARN)
 
     def refresh(self, silent=False):
         def job():
