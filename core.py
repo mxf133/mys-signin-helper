@@ -53,7 +53,7 @@ SETTINGS_FILE = BASE / "settings.json"
 LOGIN_URL = "https://www.miyoushe.com/sr/"
 
 # 版本号：界面标题栏、检查更新、打包脚本都从这里取，避免多处各写一份。
-VERSION = "3.2.2"
+VERSION = "3.2.3"
 
 # 检查更新要查的仓库（GitHub Releases）。
 GITHUB_REPO = "mxf133/mys-signin-helper"
@@ -255,6 +255,19 @@ def signed_today(game_state: dict) -> bool:
         return False
     ts = str(g.get("last_run") or "")
     return ts.startswith(datetime.now().strftime("%Y-%m-%d"))
+
+
+def all_signed_today(game_keys=None) -> bool:
+    """选中的游戏今天是不是都已经签过了（按本地记录判断）。
+
+    登录触发 / 开机补跑时用它做闸门：都签过就只查状态，不重复调签到接口，
+    也不弹"今天已经签到过了"的通知。
+    """
+    keys = [k for k in (game_keys or selected_games()) if k in GAME_KEYS]
+    if not keys:
+        keys = list(selected_games())
+    games = load_state().get("games") or {}
+    return bool(keys) and all(signed_today(games.get(k)) for k in keys)
 
 
 def save_state(**kw) -> dict:
@@ -1468,6 +1481,13 @@ def _xml_escape(s: str) -> str:
 #   DisallowStartIfOnBatteries=true / StopIfGoingOnBatteries=true  电池不跑
 #   WakeToRun=false            睡眠不唤醒（保持默认，唤醒副作用多）
 # XML 里显式把前三个配成对签到友好的值：错过后下次开机尽快补跑一次，电池也跑。
+#
+# 两个触发器是有意叠的，专门解决"到点时电脑没开"：
+#   CalendarTrigger  每天固定时间（默认 00:05）
+#   LogonTrigger     每次登录 Windows 后延迟 1 分钟再跑一次
+# 加上 StartWhenAvailable=true（错过后尽快补跑）和 RestartOnFailure（失败重试
+# 3 次，间隔 5 分钟），只要当天开过机并登录，就一定会有一次签到；
+# 已经签过的那次只会查询状态，不会重复签、也不会多弹通知（见 cli.py 的 sign）。
 _TASK_XML = """<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <Triggers>
@@ -1478,6 +1498,11 @@ _TASK_XML = """<?xml version="1.0" encoding="UTF-16"?>
         <DaysInterval>1</DaysInterval>
       </ScheduleByDay>
     </CalendarTrigger>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <UserId>%(user)s</UserId>
+      <Delay>PT1M</Delay>
+    </LogonTrigger>
   </Triggers>
   <Settings>
     <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
@@ -1499,6 +1524,10 @@ _TASK_XML = """<?xml version="1.0" encoding="UTF-16"?>
     <WakeToRun>false</WakeToRun>
     <ExecutionTimeLimit>PT1H</ExecutionTimeLimit>
     <Priority>7</Priority>
+    <RestartOnFailure>
+      <Interval>PT5M</Interval>
+      <Count>3</Count>
+    </RestartOnFailure>
   </Settings>
   <Actions Context="Author">
     <Exec>
