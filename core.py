@@ -53,7 +53,7 @@ SETTINGS_FILE = BASE / "settings.json"
 LOGIN_URL = "https://www.miyoushe.com/sr/"
 
 # 版本号：界面标题栏、检查更新、打包脚本都从这里取，避免多处各写一份。
-VERSION = "3.2.1"
+VERSION = "3.2.2"
 
 # 检查更新要查的仓库（GitHub Releases）。
 GITHUB_REPO = "mxf133/mys-signin-helper"
@@ -239,6 +239,22 @@ def load_state() -> dict:
 
 STATE_LEGACY_KEYS = ("last_run", "last_result", "last_message", "days",
                      "signed_today", "uid", "nickname")
+
+
+def signed_today(game_state: dict) -> bool:
+    """这条本地记录是不是"今天已经签过"。
+
+    不能只看 signed_today 那个布尔值：它记录的是"上次运行那一天"的状态，
+    跨天之后仍然是 True。程序启动时的自动补签就靠这个判断——不校验日期的话，
+    昨天签过、今天计划任务又没跑（关机 / 任务丢失），程序启动起来会以为
+    "今天已经签过了"，于是只查状态、不签到，表现出来就是"明明没签，打开
+    程序也不动"。必须把 last_run 的日期一起比。
+    """
+    g = game_state or {}
+    if g.get("signed_today") is not True:
+        return False
+    ts = str(g.get("last_run") or "")
+    return ts.startswith(datetime.now().strftime("%Y-%m-%d"))
 
 
 def save_state(**kw) -> dict:
@@ -1808,7 +1824,10 @@ def task_detail(use_cache: bool = True) -> dict:
             and _t.time() - _TASK_CACHE["at"] < 20:
         return dict(_TASK_CACHE["data"])
 
-    out = {"exists": False, "time": None, "next_run": None, "mode": None}
+    out = {"exists": False, "time": None, "next_run": None, "mode": None,
+           # settings 里记着"本该由计划任务负责"时，任务查不到就是"丢了"，
+           # 跟从来没开过要区分开：前者是异常（可能被清理软件删了），得提醒用户
+           "expected": load_settings().get("autostart") == "task"}
     target = None
     target = ""
     unqueryable = False

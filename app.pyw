@@ -689,6 +689,10 @@ class App:
                 self.task_hint.configure(text="每日自动签到：已开启 · 每天 %s" % t, fg=OK)
         else:
             self.task_hint.configure(text="每日自动签到：未开启", fg=SUBTEXT)
+        if not td["exists"] and td.get("expected"):
+            # settings 里记着用过计划任务，现在却查不到——多半被清理软件删了
+            self.task_hint.configure(
+                text="每日自动签到：任务已丢失，请重新点「开启 / 更新」", fg=BAD)
 
         self._render_badges(td)
 
@@ -710,6 +714,9 @@ class App:
                 self.task_badge.configure(text="自动签到：已开启 %s" % t, fg=OK)
             else:
                 self.task_badge.configure(text="自动签到：已开启", fg=OK)
+        elif td.get("expected"):
+            # 设置里记着用过计划任务，现在查不到——异常，不是"没开过"
+            self.task_badge.configure(text="自动签到：任务丢失", fg=BAD)
         else:
             self.task_badge.configure(text="自动签到：未开启", fg=SUBTEXT)
 
@@ -725,8 +732,11 @@ class App:
             # 都签过了就只查状态，避免多余的接口调用。
             st = core.load_state()
             games = st.get("games") or {}
+            # 用 core.signed_today 而不是直接看 signed_today 字段：那个字段
+            # 跨天不会失效，昨天签过会让程序误以为今天也已经签了，
+            # 于是只查状态、不签到（"明明没签，打开程序也不动"就是这么来的）。
             pending = [k for k in core.selected_games()
-                       if (games.get(k) or {}).get("signed_today") is not True]
+                       if not core.signed_today(games.get(k))]
             res = core.sign_once(force_info=not pending, on_log=self._log_cb)
             # 首次运行顺手补一次角色信息，失败不影响主流程
             if not core.load_state().get("accounts"):
