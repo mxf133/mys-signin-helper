@@ -267,12 +267,15 @@ def main():
         sys.exit(0 if res.get("ok") else 1)
     elif args.action == "sign":
         # 任务有两个触发器（每天定时 + 每次登录后的补跑），所以一天可能进来
-        # 好几次。当天已经签过就只查状态：不重复调签到接口，也不弹
-        # "今天已经签到过了"的通知——登录触发不该每天打扰人。
+        # 好几次；两个入口也可能同一秒同时开火（登录瞬间 + 定时点重合、
+        # 或者历史上残留了两个同名任务）。所以这里做两道闸门：
+        #   ① 先看本地记录，今天签过就只查状态；
+        #   ② 真正签到前抢跨进程锁（core.sign_once 的 gate=True），锁内再判一次。
+        # 这样同一天绝不会有两个进程同时调签到接口，也不会重复弹"已签到"通知。
         already = core.all_signed_today(keys)
         if already:
             core.write_log("今天已经签过了（登录补跑触发），只查询状态")
-        res = core.sign_once(keys, already)
+        res = core.sign_once(keys, already, gate=True)
         core.write_log("结果：" + core.summarize(res))
         # 计划任务在后台跑（没有窗口），每次签完都弹 Windows 系统通知：
         # 成功让用户知道今天签上了；失败则让用户下次开电脑立刻发现

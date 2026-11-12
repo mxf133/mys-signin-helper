@@ -35,7 +35,9 @@ from pathlib import Path
 APP_ID = "MiyousheSignInAssistant"
 TASK_NAME = "MYS-DailySignIn"
 ALT_TASK_NAMES = ("MiyousheSignInAssistant",)
-LEGACY_TASK_NAMES = ("MYS-DailySignInTask",)
+# 两个模块（core.py / 这个助手）曾经各记了一份"历史任务名"，清理时会漏。
+# 这里取并集，删干净才不会有遗留任务偷偷签到。
+LEGACY_TASK_NAMES = ("MYS-DailySignInTask", "HSR-DailySignIn")
 RUN_VALUE = "MiyousheSignInAssistant"
 STARTUP_NAME = "米游社签到助手（开机签到）.cmd"
 PKG_NAME = "MiyousheSignInAssistant"
@@ -93,8 +95,29 @@ def _run(cmd, **kw):
                           errors="replace", **kw)
 
 
-def _task_exists(name: str) -> bool:
-    return _run(["schtasks", "/Query", "/TN", name]).returncode == 0
+def _task_state(name: str) -> str:
+    """三态查询：'yes' 有 / 'no' 确实没有 / 'unknown' 查不了。
+
+    不能只看 returncode：安全软件会连 schtasks /Query 一起拦，返回非 0 但
+    任务其实存在。把它当成"没建成"就会换个任务名再建一个，最终两个任务
+    并存、每天各签一次（v3.2.4 修的重复签到就是这么来的）。
+    """
+    r = _run(["schtasks", "/Query", "/TN", name])
+    if r.returncode == 0:
+        return "yes"
+    text = ((r.stdout or "") + (r.stderr or "")).strip()
+    low = text.lower()
+    if ("找不到指定的任务" in text or "找不到指定的文件" in text
+            or "cannot find the file" in low or "cannot find the task" in low):
+        return "no"
+    return "unknown"
+
+
+def _dedupe_tasks(keep: str):
+    """注册成功后清掉其它别名任务，保证机器上只有一个签到任务。"""
+    for name in (TASK_NAME,) + ALT_TASK_NAMES + LEGACY_TASK_NAMES:
+        if name != keep:
+            _run(["schtasks", "/Delete", "/TN", name, "/F"])
 
 
 def _startup_dir() -> Path:
@@ -150,8 +173,11 @@ def autostart_create(time_str: str, pythonw: str, script: str) -> str:
     if xml_written:
         for name in (TASK_NAME,) + ALT_TASK_NAMES:
             r = _run(["schtasks", "/Create", "/TN", name, "/XML", str(xml_path), "/F"])
-            if r.returncode == 0 and _task_exists(name):
+            # 只有系统明确回答"不存在"才算没建成；"查不了"按成功处理，
+            # 否则会换名再建一个，留下两个任务各签一次。
+            if r.returncode == 0 and _task_state(name) != "no":
                 notes.append("task:%s" % name)
+                _dedupe_tasks(name)
                 break
             notes.append("task:%s=%s" % (name, ((r.stdout or "") + (r.stderr or "")).strip()[:60]))
         try:

@@ -18,6 +18,8 @@ import os
 import re
 import subprocess
 import sys
+import time
+import uuid
 from ctypes import wintypes
 from datetime import datetime
 from pathlib import Path
@@ -53,7 +55,7 @@ SETTINGS_FILE = BASE / "settings.json"
 LOGIN_URL = "https://www.miyoushe.com/sr/"
 
 # 版本号：界面标题栏、检查更新、打包脚本都从这里取，避免多处各写一份。
-VERSION = "3.2.3"
+VERSION = "3.2.4"
 
 # 检查更新要查的仓库（GitHub Releases）。
 GITHUB_REPO = "mxf133/mys-signin-helper"
@@ -62,7 +64,7 @@ TASK_NAME = "MYS-DailySignIn"
 # 备用任务名：安全软件可能把某个名字记进黑名单（同名怎么都建不上），
 # 换个名字就能成功，所以注册失败时自动换个名字再试。
 ALT_TASK_NAMES = ("MiyousheSignInAssistant",)
-LEGACY_TASK_NAMES = ("HSR-DailySignIn",)
+LEGACY_TASK_NAMES = ("HSR-DailySignIn", "MYS-DailySignInTask")
 
 # 米游社账号会话校验接口（米游社 web 账号 SDK 自己用的那两个）。
 # 必须分开看，因为米哈游把两套会话分得很清：
@@ -161,19 +163,48 @@ def _emit_factory(on_log):
 
 
 def _read_json(path: Path, default):
-    try:
-        if path.exists():
+    """读 JSON；解析失败重试一次再放弃。
+
+    读的一瞬间正好撞上另一个进程 os.replace，理论上能读到旧文件（合法）
+    或极少数情况下读到空文件。多给一次机会，比直接返回默认值把状态清零安全。
+    """
+    for attempt in range(2):
+        if not path.exists():
+            return default
+        try:
             return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        pass
+        except Exception:
+            if attempt == 0:
+                time.sleep(0.03)
     return default
 
 
 def _write_json(path: Path, data):
-    try:
-        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception:
-        pass
+    """原子写：先写同目录临时文件，再 os.replace 顶替。
+
+    图形界面和计划任务可能同时活着（历史上甚至有两个计划任务并存）。
+    直接 write_text 覆盖时，另一个进程正好读到这里，会读到半截 JSON；
+    _read_json 解析失败就返回默认值，接着 save_state 把整份状态写空
+    ——账号信息、凭据标记全丢。临时文件 + 原子替换能杜绝这种"读到半个文件"。
+
+    临时名里必须带 uuid：只带 PID 的话，同一进程的多个线程（界面后台任务）
+    会写到同一个临时文件上互相截断，实测能读出半截 JSON。重试几次是因为
+    Windows 上杀毒软件扫描新文件时 os.replace 偶尔会短暂失败。
+    """
+    payload = json.dumps(data, ensure_ascii=False, indent=2)
+    for _attempt in range(3):
+        tmp = path.with_name("%s.tmp-%d-%s"
+                             % (path.name, os.getpid(), uuid.uuid4().hex[:8]))
+        try:
+            tmp.write_text(payload, encoding="utf-8")
+            os.replace(tmp, path)
+            return
+        except Exception:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            time.sleep(0.05)
 
 
 # ---------------------------------------------------------------- 配置 / 状态
@@ -1313,6 +1344,64 @@ def fetch_accounts(on_log=None) -> dict:
 
 # ---------------------------------------------------------------- 签到
 
+# 签到互斥锁：同一天可能有多个入口同时开火（每天定时 + 登录补跑 + 图形界面
+# 启动补签 + 手动点击）。以前只有"读 state.json 判断今天签过没"这一道闸门，
+# 两个进程同时启动时都会读到昨天的状态、都判定未签，于是一起调签到接口
+# （服务端第二次返回"已签到"，但日志、通知、请求都跑了两遍）。
+# 用 O_EXCL 建文件做跨进程互斥：拿到锁的进程才有资格真正签到，
+# 后来者在锁内重新判定，发现今天签过就只查状态。
+SIGN_LOCK_FILE = BASE / ".sign.lock"
+SIGN_LOCK_STALE_SEC = 180       # 锁超过 3 分钟视为上一个进程已崩溃
+SIGN_LOCK_POLL_SEC = 0.5
+
+
+def _try_create_lock(path: Path) -> bool:
+    """原子地创建锁文件；已存在返回 False。"""
+    try:
+        fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except OSError:
+        return False
+    try:
+        os.write(fd, ("%d %s" % (os.getpid(), now_str())).encode("utf-8"))
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+    return True
+
+
+def _lock_age(path: Path) -> float:
+    try:
+        return time.time() - path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def acquire_sign_lock(timeout: float = 90.0) -> bool:
+    """抢签到锁；timeout 秒内没抢到返回 False（调用方应降级为"只查状态"）。"""
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        if _try_create_lock(SIGN_LOCK_FILE):
+            return True
+        if _lock_age(SIGN_LOCK_FILE) > SIGN_LOCK_STALE_SEC:
+            # 上一个进程被强杀（或改过系统时间）留下的死锁，清掉重试
+            try:
+                SIGN_LOCK_FILE.unlink()
+            except OSError:
+                pass
+            continue
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(SIGN_LOCK_POLL_SEC)
+
+
+def release_sign_lock():
+    try:
+        SIGN_LOCK_FILE.unlink()
+    except OSError:
+        pass
+
+
 async def _sign_many_async(game_keys, force_info: bool, on_log) -> dict:
     import genshin
 
@@ -1400,26 +1489,54 @@ async def _sign_many_async(game_keys, force_info: bool, on_log) -> dict:
     return out
 
 
-def sign_once(game_keys=None, force_info: bool = False, on_log=None) -> dict:
+def sign_once(game_keys=None, force_info: bool = False, on_log=None,
+              gate: bool = False) -> dict:
     """执行签到（force_info=True 时只查询状态，不重复签）。
 
     game_keys 为空表示按用户在界面上勾选的游戏（默认全部）。
     返回 {"ok": bool, "games": {key: 结果}}。
+
+    gate=True 用于计划任务 / 开机补签这种"可能被重复触发"的路径：
+      ① 先抢签到互斥锁，同一天不会有两个进程同时调签到接口；
+      ② 拿到锁后再按本地记录判一次，今天已签就只查状态；
+      ③ 抢不到锁（另一个进程正在签）时也降级为只查状态。
+    手动签到（gate=False）同样持锁，但不会因为"今天已签"被拦下来
+    —— 用户点【立即签到】就该拿到真实结果（服务端会返回"已签到"）。
     """
     keys = tuple(game_keys) if game_keys else tuple(selected_games())
     keys = tuple(k for k in keys if k in GAME_BY_KEY)
+
+    emit = _emit_factory(on_log)
+    locked = False
+    if not force_info:
+        locked = acquire_sign_lock(120.0 if gate else 45.0)
+        if not locked:
+            # gate 路径绝不冒并发重复签的风险，宁可这一次只查状态；
+            # 手动签到则继续走，最坏不过服务端回一句"今天已经签到过了"。
+            if gate:
+                emit("另一个签到进程还在运行，这次只查询状态")
+                force_info = True
+        elif gate and all_signed_today(keys):
+            # 锁内再判一次：另一个进程刚刚签完，本地记录已经更新
+            emit("今天已经签过了（另一个签到进程已完成），只查询状态")
+            force_info = True
+
     try:
-        games = asyncio.run(_sign_many_async(keys, force_info, on_log))
-    except Exception as e:
-        msg = "运行异常：%s: %s" % (type(e).__name__, e)
-        write_log(msg)
-        if on_log:
-            on_log(msg)
-        games = {k: {"ok": False, "status": "error", "message": msg, "reward": None,
-                     "days": None, "signed_today": None, "ts": now_str(),
-                     "name": game_name(k)} for k in keys}
-        for k in keys:
-            save_game_state(k, last_run=now_str(), status="error", message=msg)
+        try:
+            games = asyncio.run(_sign_many_async(keys, force_info, on_log))
+        except Exception as e:
+            msg = "运行异常：%s: %s" % (type(e).__name__, e)
+            write_log(msg)
+            if on_log:
+                on_log(msg)
+            games = {k: {"ok": False, "status": "error", "message": msg, "reward": None,
+                         "days": None, "signed_today": None, "ts": now_str(),
+                         "name": game_name(k)} for k in keys}
+            for k in keys:
+                save_game_state(k, last_run=now_str(), status="error", message=msg)
+    finally:
+        if locked:
+            release_sign_lock()
 
     return {"ok": any(g.get("ok") for g in games.values()), "games": games}
 
@@ -1694,11 +1811,6 @@ def _query_state(name: str) -> str:
     return "no" if _looks_missing(text, _is_admin()) else "unknown"
 
 
-def _query(name: str) -> bool:
-    """查询计划任务是否存在（区分不了"没有"和"查不了"时按没有处理）。"""
-    return _query_state(name) == "yes"
-
-
 # ---- 备用方案（不依赖计划任务、也绝不调用 PowerShell）--------------------
 #
 # 实测：360 安全卫士会把本程序拉起的 powershell.exe 判成 Trojan.Generic
@@ -1854,19 +1966,24 @@ def task_detail(use_cache: bool = True) -> dict:
         return dict(_TASK_CACHE["data"])
 
     out = {"exists": False, "time": None, "next_run": None, "mode": None,
+           # duplicates：除主任务外还存在的别名任务。非空 = 一天会签多次，
+           # 界面要显式报警并引导用户点「开启 / 更新」清理。
+           "duplicates": [],
            # settings 里记着"本该由计划任务负责"时，任务查不到就是"丢了"，
            # 跟从来没开过要区分开：前者是异常（可能被清理软件删了），得提醒用户
            "expected": load_settings().get("autostart") == "task"}
-    target = None
     target = ""
     unqueryable = False
+    found = []
     for n in (TASK_NAME,) + ALT_TASK_NAMES + LEGACY_TASK_NAMES:
         state = _query_state(n)
         if state == "yes":
-            target = n
-            break
-        if state == "unknown":
+            found.append(n)
+        elif state == "unknown":
             unqueryable = True
+    if found:
+        target = found[0]                     # TASK_NAME 排在最前，优先当主任务
+        out["duplicates"] = found[1:]
 
     if not target and unqueryable and load_settings().get("autostart") == "task":
         # 管理员建好的任务，普通权限的本程序常常"查不到"（安全软件连 schtasks
@@ -1918,8 +2035,52 @@ def _create_task_via_schtasks(xml_path: str, task_name: str = TASK_NAME) -> tupl
         return False, "无法调用 schtasks：%s: %s" % (type(e).__name__, e)
     if r.returncode != 0:
         return False, ((r.stdout or "") + (r.stderr or "")).strip()
-    # 复核：schtasks 返回 0 也要确认任务真的在（避免假成功）
-    return _query(task_name), "任务已创建但查询不到"
+    # 复核必须用三态，不能把"查不到"当成"没建成"：
+    # 普通权限下安全软件连 schtasks /Query 一起拦（报"系统找不到指定的路径"），
+    # 于是复核被判成失败，create_task 就换下一个任务名再建一次
+    # —— 而两个任务其实都已经真实落盘，每天各触发一次签到。
+    # 只有系统明确回答"任务不存在"才算失败。
+    state = _query_state(task_name)
+    if state == "no":
+        return False, "任务已创建但系统里查不到（可能被杀毒软件删除）"
+    return True, ""
+
+
+def _remove_task_quiet(name: str, emit=None) -> bool:
+    """删掉一个计划任务；失败只返回 False（不抛异常、不阻断主流程）。"""
+    try:
+        r = subprocess.run(["schtasks", "/Delete", "/TN", name, "/F"],
+                           capture_output=True, text=True,
+                           encoding="gbk", errors="replace")
+    except Exception:
+        return False
+    if r.returncode != 0:
+        return False
+    _TASK_CACHE["at"] = 0.0
+    if emit:
+        emit("已移除多余的计划任务「%s」" % name)
+    return True
+
+
+def _dedupe_tasks(keep: str, emit=None) -> list:
+    """只保留一个自动签到计划任务，返回被删掉的任务名。
+
+    "主名字建失败就换备用名字再试"的策略会在机器上留下两个任务，
+    而两个任务各带一套触发器（每天定时 + 登录补跑），于是一天签到两次。
+    注册成功后必须把其它别名清干净，保证反复点「开启 / 更新」是幂等的。
+    """
+    removed = []
+    for n in (TASK_NAME,) + ALT_TASK_NAMES + LEGACY_TASK_NAMES:
+        if n == keep:
+            continue
+        if _query_state(n) != "yes":
+            continue
+        if _remove_task_quiet(n, emit):
+            removed.append(n)
+        elif emit:
+            emit("多余的计划任务「%s」删不掉（需要管理员权限），"
+                 "请到「任务计划程序」里手动删除" % n)
+    return removed
 
 
 def run_elevated(parameters: str, timeout_sec: int = 180) -> tuple:
@@ -2226,16 +2387,11 @@ def create_task(time_str: str = "09:05", on_log=None,
                 "run_level": "HighestAvailable",
                 "status_text": "需要管理员权限，正在请求提权…"}
 
-    # 清理历史遗留的任务名，避免重复签到
+    # 清理历史遗留的任务名，避免重复签到。
+    # 用三态判断："查不了"也要试着删（删不存在只是报错，不会误伤）。
     for n in LEGACY_TASK_NAMES:
-        if _query(n):
-            try:
-                subprocess.run(["schtasks", "/Delete", "/TN", n, "/F"],
-                               capture_output=True, text=True,
-                               encoding="gbk", errors="replace")
-                emit("已移除旧任务 %s" % n)
-            except Exception:
-                pass
+        if _query_state(n) != "no":
+            _remove_task_quiet(n, emit)
 
     cmd, args = task_action()
     created_name = None
@@ -2275,6 +2431,8 @@ def create_task(time_str: str = "09:05", on_log=None,
 
     if created_name:
         _TASK_CACHE["at"] = 0.0
+        # 只留一个任务：历史遗留的别名任务会和刚建的这个各跑一次触发器
+        _dedupe_tasks(created_name, emit)
         save_settings(task_time=time_str, autostart="task")
         msg = "已开启每日自动签到：每天 %s 后台签到 %s" % (
             time_str, "、".join(game_name(k) for k in selected_games()))

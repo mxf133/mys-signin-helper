@@ -673,7 +673,14 @@ class App:
             self.account.configure(text="未登录", fg=BAD)
 
         td = core.task_detail()
-        if td["exists"]:
+        dups = td.get("duplicates") or []
+        if dups:
+            # 两个任务各带一套触发器，一天会签两次（v3.2.4 前"建失败就换名"
+            # 留下的）。点一次「开启 / 更新」就会清掉多余的，只留主任务。
+            self.task_hint.configure(
+                text="每日自动签到：检测到 %d 个重复任务，一天会签多次，请点「开启 / 更新」清理"
+                     % (len(dups) + 1), fg=BAD)
+        elif td["exists"]:
             t = td.get("time") or st.get("task_time") or "09:05"
             if td.get("time") and td.get("mode") == "task":
                 self.time_var.set(td["time"])
@@ -704,7 +711,10 @@ class App:
         用户却以为定时设置改不了。所以放在标题栏，不进日志也能一眼看到。
         """
         td = td or {}
-        if td.get("exists"):
+        if td.get("duplicates"):
+            # 任务确实在跑，但跑了不止一份——比"没开"更隐蔽，必须显式报警
+            self.task_badge.configure(text="自动签到：重复任务", fg=BAD)
+        elif td.get("exists"):
             t = td.get("time") or self.time_var.get() or ""
             if core.task_failure_hint(td, short=True):
                 self.task_badge.configure(text="自动签到：上次失败", fg=BAD)
@@ -737,7 +747,8 @@ class App:
             # 于是只查状态、不签到（"明明没签，打开程序也不动"就是这么来的）。
             pending = [k for k in core.selected_games()
                        if not core.signed_today(games.get(k))]
-            res = core.sign_once(force_info=not pending, on_log=self._log_cb)
+            res = core.sign_once(force_info=not pending, on_log=self._log_cb,
+                                 gate=True)
             # 首次运行顺手补一次角色信息，失败不影响主流程
             if not core.load_state().get("accounts"):
                 core.fetch_accounts(self._log_cb)
