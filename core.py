@@ -48,6 +48,8 @@ BASE = _app_dir()
 CRED_FILE = BASE / "cookie.enc"
 PROFILE_DIR = BASE / ".edge_profile"
 PW_TMP_DIR = BASE / ".pw_tmp"
+# 系统 Temp 不可用时的备用临时目录（签到、genshin 缓存都改用它）
+TEMP_FALLBACK_DIR = BASE / ".tmp"
 LOG_FILE = BASE / "signin.log"
 STATE_FILE = BASE / "state.json"
 SETTINGS_FILE = BASE / "settings.json"
@@ -55,7 +57,7 @@ SETTINGS_FILE = BASE / "settings.json"
 LOGIN_URL = "https://www.miyoushe.com/sr/"
 
 # 版本号：界面标题栏、检查更新、打包脚本都从这里取，避免多处各写一份。
-VERSION = "3.2.4"
+VERSION = "3.2.5"
 
 # 检查更新要查的仓库（GitHub Releases）。
 GITHUB_REPO = "mxf133/mys-signin-helper"
@@ -1026,6 +1028,7 @@ def notify_sign_result(result: dict, source: str = "", force: bool = False) -> b
 # ---------------------------------------------------------------- 客户端
 
 def _make_client(cookies):
+    ensure_usable_temp()      # genshin 导入期就要用临时目录，必须先确保可用
     import genshin
     return genshin.Client(cookies, region=genshin.Region.CHINESE, lang="zh-cn")
 
@@ -1041,6 +1044,64 @@ async def _close_client(client):
 
 def _game_enum(genshin, key: str):
     return getattr(genshin.Game, GAME_BY_KEY[key]["enum"])
+
+
+# ---------------------------------------------------------------- 临时目录可用性
+
+_temp_checked = False
+
+
+def _dir_writable(path: Path) -> bool:
+    """真的往目录里写一个文件再删掉，比 os.access 可靠（Windows 上 ACL 不看它）。"""
+    probe = path / (".write-test-%d" % os.getpid())
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(probe), os.O_CREAT | os.O_WRONLY | os.O_EXCL)
+        os.close(fd)
+        return True
+    except Exception:
+        return False
+    finally:
+        try:
+            probe.unlink()
+        except OSError:
+            pass
+
+
+def ensure_usable_temp() -> str:
+    """保证 tempfile / genshin 能拿到可写的临时目录，返回最终使用的路径。
+
+    为什么必须在 import genshin 之前做：genshin 是在**模块导入阶段**就取临时
+    目录的（`utility/extdb.py` 的 CACHE_FILE、`utility/logfile.py` 的
+    AUTHKEY_FILE 都是模块级 `fs.get_tempdir()`，内部就是
+    tempfile.gettempdir()）。开机瞬间由"登录后 1 分钟"触发器拉起签到进程时，
+    系统 Temp 可能还没就绪、或被安全软件的"开机清理"短暂锁住，tempfile 会把
+    所有候选挨个试一遍，然后抛：
+        FileNotFoundError: No usable temporary directory found in [...]
+    整个签到在 import 那一步就炸了，一行业务代码都没跑起来 —— 表现出来就是
+    "今天没签上，重启软件就好了"（重启时系统已经就绪）。
+
+    所以先探测系统 Temp；不可写就切到程序目录下的 .tmp，并覆盖 tempfile 的
+    缓存结论（tempfile.tempdir）。探测一次即缓存，正常机器上零额外开销。
+    """
+    global _temp_checked
+    if _temp_checked:
+        return os.environ.get("TEMP") or os.environ.get("TMP") or ""
+
+    _temp_checked = True
+    import tempfile
+
+    current = os.environ.get("TEMP") or os.environ.get("TMP") or ""
+    if current and _dir_writable(Path(current)):
+        return current
+
+    if _dir_writable(TEMP_FALLBACK_DIR):
+        for name in ("TMP", "TEMP", "TMPDIR"):
+            os.environ[name] = str(TEMP_FALLBACK_DIR)
+        tempfile.tempdir = str(TEMP_FALLBACK_DIR)   # 别让 gettempdir 重新探测
+        write_log("系统临时目录不可用，改用 %s" % TEMP_FALLBACK_DIR)
+        return str(TEMP_FALLBACK_DIR)
+    return ""
 
 
 # ---------------------------------------------------------------- Playwright 临时目录
@@ -1403,6 +1464,7 @@ def release_sign_lock():
 
 
 async def _sign_many_async(game_keys, force_info: bool, on_log) -> dict:
+    ensure_usable_temp()      # 同上：必须在 import genshin 之前
     import genshin
 
     emit = _emit_factory(on_log)

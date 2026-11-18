@@ -13,6 +13,9 @@ cookie.enc
 .pw_tmp/
 .pw_tmp*
 
+# 系统 %TEMP% 不可用时的兜底临时目录（v3.2.5）
+.tmp/
+
 # 运行日志与状态（含 UID、昵称、签到记录）
 signin.log
 state.json
