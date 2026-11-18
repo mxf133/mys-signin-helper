@@ -688,10 +688,12 @@ class App:
             if bad:
                 # 任务状态永远是"就绪"，只有「上次结果」能说明它其实每次都失败
                 self.task_hint.configure(text=bad, fg=BAD)
-            elif td.get("mode") == "startup":
-                # 计划任务被安全软件拦了，走的是启动文件夹方案
+            elif td.get("mode") in ("startup", "runkey"):
+                # 这两种方式只在「登录 Windows」时跑一次，跨天不重新登录就不签。
+                # 以前这里落到 else 分支显示"每天 00:05"，把 runkey 说成了定时任务。
                 self.task_hint.configure(
-                    text="每日自动签到：已开启（开机启动 · 约 %s）" % t, fg=OK)
+                    text="每日自动签到：仅登录时补签（计划任务被拦，无法每天定时）",
+                    fg=WARN)
             else:
                 self.task_hint.configure(text="每日自动签到：已开启 · 每天 %s" % t, fg=OK)
         else:
@@ -719,7 +721,8 @@ class App:
             if core.task_failure_hint(td, short=True):
                 self.task_badge.configure(text="自动签到：上次失败", fg=BAD)
             elif td.get("mode") in ("startup", "runkey"):
-                self.task_badge.configure(text="自动签到：开机启动", fg=OK)
+                # 不是"已开启定时"：这两种方式只在登录时跑，用橙色提醒
+                self.task_badge.configure(text="自动签到：仅登录时", fg=WARN)
             elif t:
                 self.task_badge.configure(text="自动签到：已开启 %s" % t, fg=OK)
             else:

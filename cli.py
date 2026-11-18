@@ -184,8 +184,12 @@ def doctor():
     except Exception as e:
         d = {"exists": False, "err": repr(e)}
     if d.get("exists"):
-        L.append("计划任务      : 已创建（%s，下次 %s）"
-                 % (d.get("time"), d.get("next_run")))
+        if d.get("mode") in ("runkey", "startup"):
+            L.append("自动签到      : %s（仅登录时补签，无法每天定时）"
+                     % ("注册表启动项" if d.get("mode") == "runkey" else "启动文件夹"))
+        else:
+            L.append("计划任务      : 已创建（%s，下次 %s）"
+                     % (d.get("time"), d.get("next_run")))
         if d.get("last_result_text"):
             L.append("上次运行结果  : %s" % d["last_result_text"])
         hint = core.task_failure_hint(d)

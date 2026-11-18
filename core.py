@@ -57,7 +57,7 @@ SETTINGS_FILE = BASE / "settings.json"
 LOGIN_URL = "https://www.miyoushe.com/sr/"
 
 # 版本号：界面标题栏、检查更新、打包脚本都从这里取，避免多处各写一份。
-VERSION = "3.2.5"
+VERSION = "3.2.6"
 
 # 检查更新要查的仓库（GitHub Releases）。
 GITHUB_REPO = "mxf133/mys-signin-helper"
@@ -2517,6 +2517,20 @@ def create_task(time_str: str = "09:05", on_log=None,
             return {"ok": True, "message": msg, "mode": mode_h or "task"}
         last_detail = last_detail or ("助手方式：%s" % mode_h)
 
+    # 普通权限下建不上计划任务：**不要**急着降级到"注册表启动项"。
+    # 那条路只在「登录 Windows」时跑一次，跨天不重新登录就整天不签；
+    # 更糟的是它返回 ok=True，界面会以为已经开好，连提权重试都不做
+    # （11-18 就是这样：关闭再开启 → 任务被删 → 降级 runkey → 次日 00:05 无人触发）。
+    # 计划任务是唯一能保证"每天定时"的方式，所以先请上层用管理员权限再试一次；
+    # 管理员仍然失败（极少见）才降级到 runkey / 启动文件夹。
+    if not created_name and not _is_admin():
+        msg = ("普通权限下注册计划任务被系统拒绝（通常是安全软件拦的）。"
+               "接下来会请求一次管理员权限再试，请在 UAC 窗口点「是」。")
+        emit(msg)
+        return {"ok": False, "message": msg, "need_elevated": True,
+                "run_level": level,
+                "status_text": "普通权限被拒，正在请求管理员权限…"}
+
     # 第三条路：普通权限的纯 Python 手段（注册表启动项 → 启动文件夹）
     for label, maker, mode in (("注册表启动项", _create_run_key, "runkey"),
                                ("启动文件夹", _create_startup_file, "startup")):
@@ -2528,8 +2542,11 @@ def create_task(time_str: str = "09:05", on_log=None,
             _TASK_CACHE["at"] = 0.0
             save_settings(task_time=time_str, autostart=mode)
             msg = ("系统计划任务被安全软件拦住了，已改用【%s】方式："
-                   "每次登录 Windows 后自动签到一次（当天没签的会自动补签）。"
-                   % label)
+                   "每次登录 Windows 后自动签到一次（当天没签的会自动补签）。\n"
+                   "注意：这种方式**没有定时能力**，不重新登录就不会触发"
+                   "（比如一直开机跨过午夜）；想恢复每天 %s 定时，"
+                   "请右键「以管理员身份运行」本程序再点一次【开启 / 更新】。"
+                   % (label, time_str))
             emit(msg)
             return {"ok": True, "message": msg, "mode": mode}
         last_detail = last_detail or detail
